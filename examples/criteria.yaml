@@ -1,0 +1,37 @@
+revision: 1
+criteria:
+  - id: tests
+    description: All automated tests pass
+    kind: command
+    required: true
+    override: auto
+    command: python -m pytest -q
+    expected_exit_code: 0
+    timeout_seconds: 300
+
+  - id: readme-exists
+    description: The project contains user documentation
+    kind: file_exists
+    required: true
+    override: auto
+    path: README.md
+
+  - id: readme-usage
+    description: The README contains a usage section
+    kind: file_contains
+    required: true
+    override: auto
+    path: README.md
+    contains: "## Usage"
+    regex: false
+    case_sensitive: true
+
+  - id: usability
+    description: A new user can understand the main workflow from the documentation
+    kind: ai_judge
+    required: false
+    override: auto
+    judge_prompt: Inspect README.md and decide whether setup, execution, pause/resume, and troubleshooting are explained clearly.
+    evidence_paths:
+      - README.md
+    confidence_threshold: 0.8

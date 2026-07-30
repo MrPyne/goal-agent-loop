@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Goal Agent Control Center</title>
+  <link rel="stylesheet" href="/style.css?v=0.6.4">
+</head>
+<body>
+  <div id="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">GA</div>
+        <div>
+          <h1>Goal Agent</h1>
+          <div class="project-switcher">
+            <select id="project-selector" aria-label="Active project"></select>
+            <button id="projects-button" class="button ghost compact">Projects</button>
+          </div>
+          <p id="project-path">Loading projects…</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button id="validate-button" class="button ghost">Validate</button>
+        <span id="concurrency" class="quiet-pill">0 running</span>
+        <button class="button ghost" data-bulk="pause">Pause all</button>
+        <button class="button ghost danger-text" data-bulk="stop">Stop all</button>
+        <button class="button primary" data-bulk="start">Start all</button>
+        <button id="settings-button" class="icon-button" aria-label="Settings">⚙</button>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <div class="sidebar-heading">
+        <div>
+          <span class="eyebrow">Project workspace</span>
+          <h2>Goals</h2>
+        </div>
+        <button id="new-goal-button" class="icon-button add-button" aria-label="Create goal">＋</button>
+      </div>
+      <div class="sidebar-filter">
+        <input id="goal-filter" type="search" placeholder="Filter goals">
+        <label class="checkbox-row archived-toggle"><input id="show-archived" type="checkbox">Show archived goals</label>
+      </div>
+      <div id="goal-list" class="goal-list"></div>
+      <div class="sidebar-note">
+        Concurrent goals can edit the same working tree. Use separate Git worktrees when goals may touch overlapping files.
+      </div>
+    </aside>
+
+    <main id="main-content" class="main-content">
+      <section class="empty-state">
+        <div class="empty-icon">◎</div>
+        <h2>Select a goal</h2>
+        <p>Choose an existing goal or create a new one to define success criteria and start the loop.</p>
+        <button class="button primary" id="empty-new-goal">Create a goal</button>
+      </section>
+    </main>
+  </div>
+
+
+  <div id="projects-modal" class="modal-backdrop hidden">
+    <section class="modal wide-modal project-hub">
+      <div class="modal-header">
+        <div><span class="eyebrow">Your workspaces</span><h2>Projects</h2><p class="modal-subtitle">Create a workspace or open one already on this computer.</p></div>
+        <button class="icon-button modal-close" data-close="projects-modal" aria-label="Close">×</button>
+      </div>
+      <div class="project-manager-grid">
+        <section class="card flat-card project-library">
+          <div class="card-heading project-library-heading">
+            <div><h3>Recent projects</h3><p class="muted small">Switch projects without stopping their running goals.</p></div>
+            <button id="discover-projects-button" class="button ghost compact" type="button">Find projects</button>
+          </div>
+          <div class="search-box"><span>⌕</span><input id="project-filter" type="search" placeholder="Search projects or folders"></div>
+          <div id="project-manager-list" class="project-manager-list"></div>
+          <div id="discovered-projects" class="discovered-projects hidden"></div>
+        </section>
+        <section class="card flat-card project-setup">
+          <div class="segmented-control" role="tablist">
+            <button class="segment active" type="button" data-project-mode="create">New project</button>
+            <button class="segment" type="button" data-project-mode="open">Open existing</button>
+          </div>
+
+          <form id="create-project-form" class="stack-form project-form" data-project-panel="create">
+            <div class="friendly-intro"><span class="friendly-icon">＋</span><div><strong>Create an agent workspace</strong><p>Choose a name and folder. Goal Agent creates the control files for you.</p></div></div>
+            <label>Project name<input id="create-project-title" name="title" required autocomplete="off" placeholder="My coding project"></label>
+            <label>Project folder
+              <div class="path-field">
+                <input id="create-project-path" name="path" required autocomplete="off" spellcheck="false" placeholder="Choose where the project should live">
+                <button class="button ghost browse-button" type="button" data-browse-path="create-project-path" data-picker-purpose="create">Browse…</button>
+              </div>
+              <span class="field-help">The folder can be new; it will be created automatically.</span>
+            </label>
+            <div id="create-project-path-status" class="path-status neutral">Choose a name and location.</div>
+            <div id="create-location-chips" class="quick-locations"></div>
+            <details class="advanced-options">
+              <summary>Advanced options</summary>
+              <div class="advanced-options-body">
+                <label>Default model<input name="model" placeholder="Use the OpenCode default"></label>
+                <label class="checkbox-row warning-option"><input name="force" type="checkbox">Replace an existing <code>.goal-agent</code> workspace</label>
+              </div>
+            </details>
+            <button id="create-project-submit" class="button primary large-button" type="submit">Create project</button>
+          </form>
+
+          <form id="open-project-form" class="stack-form project-form hidden" data-project-panel="open">
+            <div class="friendly-intro"><span class="friendly-icon">⌂</span><div><strong>Open an existing workspace</strong><p>Select any folder inside the project; Goal Agent will find the workspace root.</p></div></div>
+            <button class="folder-hero-button" type="button" data-browse-path="open-project-path" data-picker-purpose="open">
+              <span class="folder-hero-icon">▰</span><span><strong>Choose project folder</strong><small>Open the system folder picker</small></span>
+            </button>
+            <label class="manual-path-label">Selected folder
+              <div class="path-field">
+                <input id="open-project-path" name="path" required autocomplete="off" spellcheck="false" placeholder="No folder selected">
+                <button class="button ghost browse-button" type="button" data-open-folder-browser="open-project-path" data-picker-purpose="open">Browse here</button>
+              </div>
+            </label>
+            <div id="open-project-path-status" class="path-status neutral">Choose a folder containing a Goal Agent project.</div>
+            <label>Display name <span>optional</span><input name="title" placeholder="Use the folder name"></label>
+            <button id="open-project-submit" class="button primary large-button" type="submit">Open project</button>
+          </form>
+        </section>
+      </div>
+      <p class="muted small project-safety-note">Removing a project from this dashboard never deletes its files.</p>
+    </section>
+  </div>
+
+  <div id="folder-picker-modal" class="modal-backdrop hidden">
+    <section class="modal folder-picker-modal">
+      <div class="modal-header">
+        <div><span class="eyebrow">Browse this computer</span><h2 id="folder-picker-title">Choose a folder</h2></div>
+        <button class="icon-button modal-close" data-close="folder-picker-modal" aria-label="Close">×</button>
+      </div>
+      <div class="folder-picker-toolbar">
+        <button id="folder-up-button" class="icon-button" type="button" title="Go up one folder">↑</button>
+        <div class="path-field grow"><input id="folder-current-path" autocomplete="off" spellcheck="false"><button id="folder-go-button" class="button ghost" type="button">Go</button></div>
+        <button id="native-folder-picker-button" class="button primary" type="button">System picker</button>
+      </div>
+      <div class="folder-picker-layout">
+        <aside id="folder-quick-locations" class="folder-quick-locations"></aside>
+        <section class="folder-browser-panel">
+          <div class="folder-browser-heading">
+            <div class="search-box"><span>⌕</span><input id="folder-search" type="search" placeholder="Filter folders here"></div>
+            <button id="new-folder-button" class="button ghost compact" type="button">New folder</button>
+          </div>
+          <div id="folder-list" class="folder-list"></div>
+          <div id="folder-picker-status" class="path-status neutral"></div>
+        </section>
+      </div>
+      <div class="modal-footer folder-picker-footer">
+        <button class="button ghost modal-close" data-close="folder-picker-modal" type="button">Cancel</button>
+        <button id="select-folder-button" class="button primary" type="button">Use this folder</button>
+      </div>
+    </section>
+  </div>
+
+  <div id="validation-modal" class="modal-backdrop hidden">
+    <section class="modal compact-modal">
+      <div class="modal-header">
+        <div><span class="eyebrow">CLI equivalent: validate</span><h2>Project validation</h2></div>
+        <button class="icon-button modal-close" data-close="validation-modal">×</button>
+      </div>
+      <div id="validation-result" class="validation-result"></div>
+    </section>
+  </div>
+
+  <div id="new-goal-modal" class="modal-backdrop hidden">
+    <section class="modal compact-modal">
+      <div class="modal-header">
+        <div><span class="eyebrow">New workstream</span><h2>Create goal</h2></div>
+        <button class="icon-button modal-close" data-close="new-goal-modal">×</button>
+      </div>
+      <form id="new-goal-form" class="form-grid">
+        <label class="full">Goal title<input id="new-goal-title" name="title" required autocomplete="off" placeholder="Repair authentication flow"></label>
+        <label class="full">What should be achieved?<textarea name="goal" rows="5" placeholder="Describe the outcome in normal language. You can refine it with AI after creation."></textarea></label>
+        <label class="full">Description <span>optional</span><textarea name="description" rows="2" placeholder="Any helpful context about this workstream"></textarea></label>
+        <details class="advanced-options full">
+          <summary>Advanced: goal ID</summary>
+          <div class="advanced-options-body"><label>Goal ID <span>created automatically from the title</span><input id="new-goal-id" name="id" pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" placeholder="repair-auth-flow"></label></div>
+        </details>
+        <div class="form-actions full">
+          <button type="button" class="button ghost modal-close" data-close="new-goal-modal">Cancel</button>
+          <button type="submit" class="button primary">Create goal</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <div id="settings-modal" class="modal-backdrop hidden">
+    <section class="modal">
+      <div class="modal-header">
+        <div><span class="eyebrow">Project-wide</span><h2>Runtime settings</h2></div>
+        <button class="icon-button modal-close" data-close="settings-modal">×</button>
+      </div>
+      <form id="settings-form" class="form-grid two-column"></form>
+    </section>
+  </div>
+
+  <div id="ai-modal" class="modal-backdrop hidden">
+    <section class="modal wide-modal">
+      <div class="modal-header">
+        <div><span class="eyebrow">OpenCode collaborator</span><h2 id="ai-modal-title">Refine goal and criteria</h2></div>
+        <button class="icon-button modal-close" data-close="ai-modal">×</button>
+      </div>
+      <div class="ai-layout refinement-layout">
+        <div class="ai-input-panel refinement-chat-panel">
+          <div class="refinement-panel-heading">
+            <div><span class="eyebrow">Conversation</span><strong>Work it out with the AI</strong></div>
+            <button id="ai-reset" class="button ghost compact" type="button">New conversation</button>
+          </div>
+          <p id="ai-help" class="muted">Answer questions, correct assumptions, and ask the AI to tighten weak criteria.</p>
+          <div id="ai-conversation" class="ai-conversation"><p class="muted small">No refinement messages yet.</p></div>
+          <label class="ai-reply-label">Your reply
+            <textarea id="ai-feedback" rows="5" placeholder="Answer the questions or explain what should change. You can also say: Perform a final readiness review and make every criterion concrete."></textarea>
+          </label>
+          <button id="ai-generate" class="button primary full-width">Start refinement</button>
+          <div id="ai-working" class="working ai-job-working hidden">
+            <span class="spinner"></span>
+            <div><strong id="ai-working-stage">OpenCode is preparing a proposal…</strong><small id="ai-working-detail">Starting…</small></div>
+          </div>
+          <button id="ai-cancel" class="button ghost full-width hidden" type="button">Cancel AI turn</button>
+        </div>
+        <div class="refinement-draft-panel">
+          <div class="refinement-panel-heading"><div><span class="eyebrow">Current draft</span><strong>Goal and proof of success</strong></div><span id="ai-readiness" class="badge">Not reviewed</span></div>
+          <div id="ai-result" class="ai-result empty-result">Start the conversation to create a draft.</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="button ghost modal-close" data-close="ai-modal">Close</button>
+        <button id="ai-apply" class="button ghost hidden">Apply draft to editor</button>
+        <button id="ai-finalize" class="button primary hidden">Finalize and save</button>
+      </div>
+    </section>
+  </div>
+
+  <div id="toast-stack" class="toast-stack"></div>
+  <script src="/app.js?v=0.6.4"></script>
+  <script src="/friendly.js?v=0.6.4"></script>
+</body>
+</html>
