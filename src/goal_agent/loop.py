@@ -280,6 +280,7 @@ class GoalAgentLoop:
             hypothesis=hypothesis,
             steering=steering,
             baseline_results=before,
+            consecutive_no_progress=self.state.consecutive_no_progress,
         )
         self.store.save_run_artifact(iteration, "executor-prompt.md", execute_prompt)
         report: ExecutionReport
@@ -332,6 +333,7 @@ class GoalAgentLoop:
                 steering=steering,
                 baseline_results=before,
                 execution_directive=escalation_directive,
+                consecutive_no_progress=self.state.consecutive_no_progress,
             )
             self.store.save_run_artifact(iteration, "executor-retry-prompt.md", retry_prompt)
             self._update_agent(

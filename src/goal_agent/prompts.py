@@ -369,6 +369,7 @@ def executor_prompt(
     steering: str,
     baseline_results: dict | None = None,
     execution_directive: str = "",
+    consecutive_no_progress: int = 0,
 ) -> str:
     failing_baseline: list[dict] = []
     if baseline_results:
@@ -403,9 +404,43 @@ def executor_prompt(
         if criterion.command
     ]
 
+    # When the loop has been stuck, derive a forced first action from the hypothesis plan or failing
+    # command criteria so the model cannot fall back to pure reconnaissance.
+    forced_first_action = ""
+    if consecutive_no_progress >= 2:
+        # Prefer the first concrete command criterion that is currently failing.
+        first_command: str | None = None
+        for criterion in criteria.criteria:
+            if criterion.command and criterion.required:
+                first_command = criterion.command
+                break
+        # Also try to pull the first non-inspection plan step (contains 'run', 'create', 'fix', 'execute').
+        first_plan_action: str | None = None
+        action_keywords = ("run ", "create ", "fix ", "execute ", "write ", "add ", "implement ")
+        for step in (hypothesis.plan or []):
+            if any(step.lower().startswith(kw) or f" {kw}" in step.lower() for kw in action_keywords):
+                first_plan_action = step
+                break
+
+        parts: list[str] = []
+        if first_plan_action:
+            parts.append(f"Plan action: {first_plan_action}")
+        if first_command:
+            parts.append(f"Criterion command to run: {first_command}")
+        if parts:
+            forced_first_action = (
+                f"\n\nFORCED FIRST ACTION (the loop has had no measurable progress for "
+                f"{consecutive_no_progress} consecutive iterations because the executor "
+                "only performed file/directory reconnaissance without making changes).\n"
+                "Your first tool call MUST be one of these concrete actions — not a directory listing "
+                "or project-root file read:\n"
+                + "\n".join(f"  {i+1}. {p}" for i, p in enumerate(parts))
+                + "\nDo NOT output the final report JSON until you have executed at least one of the above."
+            )
+
     return f"""
 You are the executor in a persistent autonomous goal loop. Work directly in the current project directory.
-You may inspect files, edit files, create files, and run commands needed to pursue the active hypothesis.
+You may inspect files, edit files, create files, and run commands needed to pursue the active hypothesis.{forced_first_action}
 
 GOAL
 {_clip(goal, 8000)}
