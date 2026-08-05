@@ -491,9 +491,13 @@ def _profile_tool_budget(
     if context_window_tokens is not None:
         scale = max(0.2, min(1.0, context_window_tokens / _DEFAULT_MODEL_CONTEXT_TOKENS))
         budget = max(24_000, int(budget * scale))
-    if not recovery_level:
-        return budget
-    return max(24_000, budget // (2 ** recovery_level))
+    # Recovery sessions start fresh with no accumulated prior turns, so there is
+    # no prior context to conserve.  Apply at most a halving on the first retry
+    # and keep it constant thereafter; avoid the previous exponential shrink that
+    # made even modest file reads exceed the budget at level >= 2.
+    if recovery_level >= 1:
+        budget = max(48_000, budget // 2)
+    return budget
 
 
 def _opencode_environment(
