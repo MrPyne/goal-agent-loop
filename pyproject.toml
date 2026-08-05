@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goal-agent-loop"
-version = "0.6.4"
+version = "0.6.7"
 description = "A persistent multi-goal OpenCode-backed AI agent loop with a local web control center."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -43,3 +43,6 @@ goal_agent = ["web_assets/*.html", "web_assets/*.css", "web_assets/*.js"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+filterwarnings = [
+  'ignore:Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead\.:Warning',
+]

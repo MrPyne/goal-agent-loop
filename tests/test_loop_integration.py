@@ -213,7 +213,7 @@ raise SystemExit(1)
 
     async def scenario():
         task = asyncio.create_task(GoalAgentLoop(store).run_forever())
-        for _ in range(500):
+        for _ in range(1200):
             state = store.load_state()
             if (
                 state.phase == RunPhase.PAUSED

@@ -61,6 +61,26 @@ def test_command_criterion(tmp_path: Path) -> None:
     assert any("123" in evidence for evidence in result.evidence)
 
 
+def test_command_criterion_supports_stdout_and_regex_checks(tmp_path: Path) -> None:
+    config = AppConfig(project_dir=str(tmp_path), poll_interval_seconds=0.01)
+    evaluator = CriteriaEvaluator(config, DummyRunner())  # type: ignore[arg-type]
+    criterion = CriterionDefinition(
+        id="command-output",
+        description="Command output includes required markers",
+        kind=CriterionKind.COMMAND,
+        command=f'"{sys.executable}" -c "print(\'STATUS: PASS\')"',
+        stdout_contains="STATUS:",
+        stdout_regex=r"PASS$",
+    )
+
+    result = asyncio.run(
+        evaluator.evaluate_one(criterion, goal="g", steering="", model=None)
+    )
+
+    assert result.passed
+    assert any("stdout matched" in evidence for evidence in result.evidence)
+
+
 def test_all_required_pass_requires_at_least_one_required() -> None:
     optional = CriterionDefinition(
         id="optional",
@@ -136,3 +156,93 @@ def test_manual_criterion_is_explicitly_human_only(tmp_path: Path) -> None:
     assert not result.passed
     assert result.evaluation_method == "human_required"
     assert "Human approval is required" in result.summary
+
+
+class CapturingJudgeRunner:
+    def __init__(self) -> None:
+        self.prompt = ""
+        self.kwargs = {}
+
+    async def run_structured(self, prompt, *args, **kwargs):
+        self.prompt = prompt
+        self.kwargs = kwargs
+        return (
+            JudgeDecision(
+                passed=True,
+                confidence=0.9,
+                summary="Evidence satisfies the rubric.",
+                evidence=["report says PASS"],
+                missing=[],
+            ),
+            None,
+        )
+
+
+class CommandJudgeRunner:
+    def __init__(self) -> None:
+        self.prompt = ""
+
+    async def run_structured(self, prompt, *args, **kwargs):
+        self.prompt = prompt
+        return (
+            JudgeDecision(
+                passed=True,
+                confidence=0.91,
+                summary="Output rubric satisfied by concrete output evidence.",
+                evidence=["stdout contains STATUS: PASS"],
+                missing=[],
+            ),
+            None,
+        )
+
+
+def test_ai_judge_receives_bounded_evidence_without_tools(tmp_path: Path) -> None:
+    report = tmp_path / "report.md"
+    report.write_text("PASS only if this exact evidence is present.\n" + "x" * 50000, encoding="utf-8")
+    runner = CapturingJudgeRunner()
+    config = AppConfig(project_dir=str(tmp_path), poll_interval_seconds=0.01)
+    evaluator = CriteriaEvaluator(config, runner)  # type: ignore[arg-type]
+    criterion = CriterionDefinition(
+        id="report-quality",
+        description="The report meets the rubric",
+        kind=CriterionKind.AI_JUDGE,
+        judge_prompt="PASS only if the report contains the required evidence. FAIL if it does not.",
+        evidence_paths=["report.md"],
+        confidence_threshold=0.8,
+    )
+
+    result = asyncio.run(
+        evaluator.evaluate_one(criterion, goal="Produce the report", steering="", model=None)
+    )
+
+    assert result.passed
+    assert "report.md" in runner.prompt
+    assert "PASS only if this exact evidence is present" in runner.prompt
+    assert "middle omitted by Goal Agent evidence budget" in runner.prompt
+    assert runner.kwargs["profile"] == "judge"
+    assert len(runner.prompt) < 60000
+
+
+def test_command_can_use_ai_judge_on_output(tmp_path: Path) -> None:
+    runner = CommandJudgeRunner()
+    config = AppConfig(project_dir=str(tmp_path), poll_interval_seconds=0.01)
+    evaluator = CriteriaEvaluator(config, runner)  # type: ignore[arg-type]
+    criterion = CriterionDefinition(
+        id="judge-output",
+        description="The smoke check output confirms success criteria",
+        kind=CriterionKind.COMMAND,
+        command=f'"{sys.executable}" -c "print(\'STATUS: PASS\')"',
+        output_judge_prompt=(
+            "PASS only if stdout confirms STATUS: PASS and no failure marker appears. "
+            "FAIL if the output is ambiguous or indicates failure."
+        ),
+        output_confidence_threshold=0.8,
+    )
+
+    result = asyncio.run(
+        evaluator.evaluate_one(criterion, goal="Run smoke check", steering="", model=None)
+    )
+
+    assert result.passed
+    assert result.confidence == 0.91
+    assert "STATUS: PASS" in runner.prompt

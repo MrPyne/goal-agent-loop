@@ -11,6 +11,7 @@ from .models import CriteriaDocument, SetupProposal
 from .opencode import OpenCodeRunner
 from .proposal_quality import assess_setup_proposal
 from .prompts import criteria_refinement_prompt, setup_prompt
+from .project_snapshot import collect_project_snapshot
 from .storage import ProjectStore
 
 
@@ -25,19 +26,26 @@ class SetupWizard:
             config.model = model
             self.store.write_config(config)
         runner = OpenCodeRunner(config)
+        project_snapshot = collect_project_snapshot(config.project_path)
         rough_goal = rough_goal or Prompt.ask("Describe the outcome you want")
         answers: list[str] = []
 
         while True:
             self.console.print("\n[bold]AI goal refinement[/bold]")
             proposal, _ = await runner.run_structured(
-                setup_prompt(rough_goal, "\n".join(answers)),
+                setup_prompt(
+                    rough_goal,
+                    "\n".join(answers),
+                    project_snapshot=project_snapshot,
+                ),
                 SetupProposal,
                 model=config.model,
                 agent=config.strategist_agent,
                 title="Goal loop setup: refine goal",
+                attempts=4,
+                profile="refinement",
             )
-            proposal = assess_setup_proposal(proposal)
+            proposal = assess_setup_proposal(proposal, project_path=config.project_path)
             if proposal.assistant_message:
                 self.console.print(Panel(proposal.assistant_message, title="AI collaborator"))
             if proposal.clarifying_questions:
@@ -116,6 +124,7 @@ class SetupWizard:
                 model=config.model,
                 agent=config.strategist_agent,
                 title="Goal loop setup: refine criteria",
+                profile="analysis",
             )
             criteria.revision += 1
 

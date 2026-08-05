@@ -66,6 +66,7 @@ class AppConfig(BaseModel):
     iteration_delay_seconds: float = 2.0
     opencode_timeout_seconds: int = 1800
     criterion_timeout_seconds: int = 300
+    model_context_tokens: int | None = Field(default=None, ge=4096, le=2_000_000)
     max_iterations: int | None = None
     max_recent_hypotheses: int = 12
     no_progress_rethink_after: int = 3
@@ -107,6 +108,13 @@ class CriterionDefinition(BaseModel):
     command: str | None = None
     expected_exit_code: int = 0
     timeout_seconds: int | None = None
+    stdout_contains: str | None = None
+    stderr_contains: str | None = None
+    stdout_regex: str | None = None
+    stderr_regex: str | None = None
+    output_case_sensitive: bool = True
+    output_judge_prompt: str | None = None
+    output_confidence_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
 
     path: str | None = None
     contains: str | None = None

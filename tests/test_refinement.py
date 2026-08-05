@@ -67,6 +67,102 @@ def test_proposal_quality_accepts_concrete_command_criterion() -> None:
     assert not [item for item in checked.criteria_quality_issues if item.severity == "blocking"]
 
 
+def test_proposal_quality_blocks_required_file_exists_only_gate() -> None:
+    proposal = SetupProposal(
+        refined_goal="Deliver a reliable reporting pipeline",
+        ready_to_finalize=True,
+        criteria=[
+            CriterionDefinition(
+                id="artifact",
+                description="The report artifact file exists",
+                kind=CriterionKind.FILE_EXISTS,
+                path="report.json",
+                required=True,
+            )
+        ],
+    )
+
+    checked = assess_setup_proposal(proposal)
+
+    assert checked.ready_to_finalize is False
+    assert any(
+        "only check that files exist" in item.issue.lower()
+        for item in checked.criteria_quality_issues
+    )
+
+
+def test_proposal_quality_blocks_missing_required_command_executable(tmp_path: Path) -> None:
+    proposal = SetupProposal(
+        refined_goal="Verify build output",
+        ready_to_finalize=True,
+        criteria=[
+            CriterionDefinition(
+                id="verify",
+                description="Run the project verification command",
+                kind=CriterionKind.COMMAND,
+                command="definitely-missing-command --verify",
+                required=True,
+            )
+        ],
+    )
+
+    checked = assess_setup_proposal(proposal, project_path=tmp_path)
+
+    assert checked.ready_to_finalize is False
+    assert any(
+        "could not be resolved" in item.issue.lower() and item.severity == "blocking"
+        for item in checked.criteria_quality_issues
+    )
+
+
+def test_proposal_quality_blocks_missing_python_script_target(tmp_path: Path) -> None:
+    proposal = SetupProposal(
+        refined_goal="Run project verification script",
+        ready_to_finalize=True,
+        criteria=[
+            CriterionDefinition(
+                id="verify-script",
+                description="Run the local Python verification script",
+                kind=CriterionKind.COMMAND,
+                command="python scripts/verify_goal.py",
+                required=True,
+            )
+        ],
+    )
+
+    checked = assess_setup_proposal(proposal, project_path=tmp_path)
+
+    assert checked.ready_to_finalize is False
+    assert any(
+        "does not exist in the project" in item.issue.lower() and item.severity == "blocking"
+        for item in checked.criteria_quality_issues
+    )
+
+
+def test_proposal_quality_blocks_paths_outside_project(tmp_path: Path) -> None:
+    proposal = SetupProposal(
+        refined_goal="Generate secure output",
+        ready_to_finalize=True,
+        criteria=[
+            CriterionDefinition(
+                id="outside",
+                description="Output file exists",
+                kind=CriterionKind.FILE_EXISTS,
+                path="../outside.txt",
+                required=True,
+            )
+        ],
+    )
+
+    checked = assess_setup_proposal(proposal, project_path=tmp_path)
+
+    assert checked.ready_to_finalize is False
+    assert any(
+        "escapes the project directory" in item.issue.lower()
+        for item in checked.criteria_quality_issues
+    )
+
+
 def test_refinement_session_persists(tmp_path: Path) -> None:
     store = ProjectStore(tmp_path)
     store.initialize(model="fake/model")
@@ -141,6 +237,7 @@ print(json.dumps({"type": "text", "part": {"type": "text", "text": text}}))
     config.opencode_timeout_seconds = 10
     store.write_config(config)
     store.write_goal("Create a video publishing plan")
+    (tmp_path / "verify_channel_plan.py").write_text("print('ok')\n", encoding="utf-8")
 
     with TestClient(create_app(tmp_path)) as client:
         first = client.post(
@@ -281,6 +378,7 @@ print(json.dumps({"type": "text", "part": {"type": "text", "text": text}}))
     config.opencode_timeout_seconds = 10
     store.write_config(config)
     store.write_goal("Create a context-safe goal definition")
+    (tmp_path / "verify_context.py").write_text("print('ok')\n", encoding="utf-8")
 
     with TestClient(create_app(tmp_path)) as client:
         response = client.post(
@@ -297,3 +395,71 @@ print(json.dumps({"type": "text", "part": {"type": "text", "text": text}}))
     assert session.last_context_mode == "compact_retry"
     assert session.current_proposal is not None
     assert session.current_proposal.ready_to_finalize is True
+
+
+def test_refinement_uses_bounded_snapshot_without_opencode_tools(tmp_path: Path) -> None:
+    fake = tmp_path / "snapshot_refinement_opencode.py"
+    fake.write_text(
+        r'''
+import json
+import os
+import pathlib
+import sys
+
+args = sys.argv[1:]
+if args == ["run", "--help"]:
+    print("--dangerously-skip-permissions")
+    raise SystemExit(0)
+prompt = sys.stdin.read()
+config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
+agent = config["agent"]["plan"]
+assert "steps" not in agent
+assert "maxSteps" not in agent
+assert agent["permission"] == {"*": "deny"}
+assert "response-only goal and success-criteria refiner" in agent["prompt"]
+assert "Project purpose from README" in prompt
+assert "Do not call tools" in prompt
+pathlib.Path("captured-refinement-prompt.txt").write_text(prompt, encoding="utf-8")
+proposal = {
+    "refined_goal": "Create a verified README-backed project outcome.",
+    "assistant_message": "I used the supplied bounded snapshot.",
+    "clarifying_questions": [],
+    "assumptions": [],
+    "criteria": [{
+        "id": "verify-outcome",
+        "description": "The verification command confirms the outcome.",
+        "kind": "command",
+        "command": "python verify_outcome.py",
+        "expected_exit_code": 0,
+        "required": True
+    }],
+    "criteria_quality_issues": [],
+    "ready_to_finalize": True,
+    "readiness_reason": "A deterministic command verifies the outcome."
+}
+text = "<GOAL_AGENT_JSON>\n" + json.dumps(proposal) + "\n</GOAL_AGENT_JSON>"
+print(json.dumps({"type":"text","part":{"type":"text","text":text}}))
+''',
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text("Project purpose from README", encoding="utf-8")
+    store = ProjectStore(tmp_path)
+    store.initialize(model="fake/model")
+    config = store.read_config()
+    config.opencode_command = [sys.executable, str(fake)]
+    config.poll_interval_seconds = 0.01
+    config.opencode_timeout_seconds = 10
+    store.write_config(config)
+    store.write_goal("Create a verified project outcome")
+    (tmp_path / "verify_outcome.py").write_text("print('ok')\n", encoding="utf-8")
+
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.post(
+            "/api/goals/default/proposal-jobs",
+            json={"mode": "goal", "feedback": "Make it concrete."},
+        )
+        job = _poll(client, response.json()["id"])
+
+    assert job["status"] == "completed", job
+    assert job["result"]["ready_to_finalize"] is True
+    assert (tmp_path / "captured-refinement-prompt.txt").exists()

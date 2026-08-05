@@ -90,7 +90,7 @@ proposal = {
     ]
 }
 text = "<GOAL_AGENT_JSON>\n" + json.dumps(proposal) + "\n</GOAL_AGENT_JSON>"
-print(json.dumps({"type": "tool_use", "part": {"type": "tool", "tool": "read", "state": {"status": "completed"}, "output": "x" * 200000}}))
+print(json.dumps({"type": "tool_use", "part": {"type": "tool", "tool": "read", "state": {"status": "completed"}, "output": "x" * 50000}}))
 print(json.dumps({"type": "text", "part": {"type": "text", "text": text}}))
 ''',
         encoding="utf-8",
@@ -203,4 +203,4 @@ def test_live_polling_preserves_focused_steering_input() -> None:
     assert '${esc(steeringDraft())}</textarea>' in script
     assert 'Date.now() < state.interactionHoldUntil' in script
     assert 'const detail = await api(`/api/goals/${encodeURIComponent(state.selectedId)}`);\n      applyPolledDetail(detail);' in script
-    assert "/app.js?v=0.6.4" in html
+    assert "/app.js?v=0.7.1" in html

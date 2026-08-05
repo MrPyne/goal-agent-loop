@@ -1,6 +1,6 @@
 # Goal Agent Loop
 
-A persistent Python orchestration layer for OpenCode that works toward explicit goals until their success criteria pass. Version 0.6.4 makes live dashboard polling interaction-safe so status updates no longer replace focused controls or erase an unfinished steering note.
+A persistent Python orchestration layer for OpenCode that works toward explicit goals until their success criteria pass. Version 0.6.7 fixes empty one-token refinement responses from local OpenAI-compatible models by keeping tool-free roles out of OpenCode's max-step assistant-prefill path and giving them a dedicated response-only prompt.
 
 Each goal follows the same evidence-driven cycle:
 
@@ -28,11 +28,14 @@ The project is intended for local models through OpenCode, including OpenCode co
 - Saved refinement conversations per goal, with explicit assumptions, unresolved questions, readiness status, and one-click finalization.
 - Context-safe refinement prompts that preserve the full UI transcript while compacting older model context and retaining recent corrections plus the current draft.
 - Automatic recovery from OpenCode context overflow for every agent role using a fresh process, smaller task brief, restricted inspection, pruned tool history, and reserved context headroom.
+- Proactive per-role OpenCode profiles: strategist, evaluator, and goal-refinement calls are tool-free; AI criterion and refinement evidence is gathered by Goal Agent under strict size budgets; executor tool output is stopped before it can overflow the next model request.
+- Finite executor step limits plus least-privilege permissions applied only to Goal Agent child processes. Tool-free strategist, evaluator, and refinement calls intentionally have no max-step cap because OpenCode's last-step assistant prefill can make some local providers return an immediate end token. The user's normal OpenCode configuration is not rewritten.
 - Automatic pause after recovery is genuinely exhausted, preventing an endless loop of identical context errors.
 - A deterministic criteria-quality guard that blocks finalization of vague or non-verifiable stopping rules.
 - Cancellable background proposal jobs with live OpenCode progress, parsing status, retries, and persistent error messages.
 - Strategist, executor, and evaluator roles for every goal.
 - Deterministic command and file checks plus qualitative AI evidence reviews that can pass criteria autonomously.
+- Command criteria can also assert stdout/stderr text or regex patterns, and can optionally use an AI rubric to judge command output quality.
 - Structured AI diagnosis of every passing, failing, and errored criterion result on every evaluation.
 - Human-only approval gates remain available as an explicit exception and are clearly warned about in the GUI and validation.
 - Live goal, criteria, steering, model, and control changes without resetting history.
@@ -130,17 +133,23 @@ Confirm that OpenCode can see the model:
 opencode models
 ```
 
+### Refinement output recovery
+
+If OpenCode exits successfully but emits only tool and step events, Goal Agent reports that no final assistant response was produced instead of showing Python's misleading `Extra data` parser error. Version 0.6.7 also handles the `step_start` → `step_finish` pattern with `output: 1`: tool-free roles no longer set `steps: 1`, and their selected OpenCode agent receives a temporary response-only prompt. This avoids OpenCode's max-step assistant-prefill path, which can cause an immediate EOS response with some local OpenAI-compatible providers. Structured calls still retry in a fresh process, and diagnostics remain bounded.
+
+The project snapshot is intentionally high-level. Goal Agent includes a root listing and up to eight preferred contract/configuration files, excludes `.goal-agent`, `.git`, virtual environments, dependency trees, build output, caches, logs, and generated data, and never falls back to arbitrary source files merely to fill the snapshot.
+
 ### Context-window protection
 
 Goal Agent starts each OpenCode role as a new non-continued session. For child runs it also supplies an inline OpenCode
-compaction override equivalent to:
+compaction override with adaptive reserved headroom:
 
 ```json
 {
   "compaction": {
     "auto": true,
     "prune": true,
-    "reserved": 12000
+    "reserved": "adaptive (about 28% of model context, min 4096, max 24000)"
   }
 }
 ```
@@ -148,6 +157,14 @@ compaction override equivalent to:
 This override is passed through `OPENCODE_CONFIG_CONTENT`; it does not edit the project's `opencode.json`. Existing
 inline JSON settings are preserved. Pruning removes older tool results and the reserved buffer leaves room for tool
 schemas, a final model response, and compaction.
+
+If your provider context size is known and not discoverable from OpenCode inline config, set it in `.goal-agent/config.yaml`:
+
+```yaml
+model_context_tokens: 32768
+```
+
+This allows Goal Agent to scale prompt and tool-output budgets for smaller windows before overflow occurs.
 
 If OpenCode still reports a context overflow, Goal Agent starts a fresh recovery process rather than continuing the
 failed session. The recovery prompt preserves the task while limiting broad searches, subagents, large files, noisy
@@ -682,7 +699,7 @@ Version 0.4.1 and newer should normally keep the simpler default value `opencode
 
 The GUI starts **AI refine goal** and **AI improve criteria** as background jobs. The dialog polls the job and shows the latest OpenCode stage, including startup, tool activity, response receipt, schema validation, and format retries. You can close the dialog or cancel the active proposal without freezing the rest of the dashboard.
 
-OpenCode's `--format json` output is newline-delimited JSON. Tool-result events may be much larger than Python's default 64 KiB stream line limit, so Goal Agent reads the stream in chunks and supports individual records up to 32 MiB. Reader failures terminate the OpenCode process and surface an error instead of waiting for the normal OpenCode timeout.
+OpenCode's `--format json` output is newline-delimited JSON: each line is an event such as `step_start`, `tool_use`, `text`, or `step_finish`. Goal Agent parses those records individually and extracts proposal JSON only from completed assistant text events. It never tries to parse the entire event stream as one JSON object. Tool-result events may be much larger than Python's default 64 KiB stream line limit, so the stream is read in chunks and supports individual records up to 32 MiB. Reader failures terminate the OpenCode process and surface an error instead of waiting for the normal OpenCode timeout.
 
 ### Context-window protection
 
@@ -695,9 +712,19 @@ Long refinement conversations do not send the entire raw transcript back to the 
 
 The normal Goal Agent input budget is intentionally kept well below the model context size so OpenCode has room for its own system instructions, file reads, and tool results. The refinement dialog reports the estimated Goal Agent input size and how many older messages were compacted.
 
-If OpenCode still emits `ContextOverflowError`, Goal Agent recognizes the structured error, records the token counts when available, and automatically retries once with a smaller prompt plus instructions to avoid broad searches, large files, dependency trees, generated output, logs, and subagents. The full saved conversation is not deleted.
+OpenCode auto-compaction is reactive: it generally decides whether to compact from the context already accumulated by a completed step. A single new tool-heavy turn can therefore jump from a safe context to an oversized next request before OpenCode gets another opportunity to compact. Compaction can also fail if the compaction request itself no longer fits.
 
-If the compact retry also exceeds the context window, increase the local model server context if memory permits. For llama.cpp, that normally means restarting `llama-server` with a larger `-c` value, for example:
+Goal Agent 0.6.7 no longer relies on OpenCode compaction as the only guard. It applies a dedicated execution profile to each child call:
+
+- strategist and diagnostic evaluator calls receive all required evidence in the prompt and have project tools disabled;
+- AI-reviewed criteria receive a bounded evidence snapshot collected directly by Goal Agent and have tools disabled;
+- refinement receives a bounded root listing plus preferred project contracts such as `README.md`, `PROJECT_CHARTER.md`, `MODEL_CARD.md`, and build manifests, then runs with all OpenCode tools denied, a response-only agent prompt, and no max-step prefill;
+- executor calls have finite agent-step limits, subagents and unrelated tools denied, and a streamed tool-output budget;
+- when an executor crosses that budget, Goal Agent terminates the child before its next model request and starts a fresh, stricter retry using the current workspace state.
+
+If OpenCode still emits `ContextOverflowError`, Goal Agent records the token counts and retries in a new process with a compact task brief. The full saved goal, history, and refinement conversation are not deleted.
+
+If the strict retry also exceeds the context window, increase the local model server context if memory permits. For llama.cpp, that normally means restarting `llama-server` with a larger `-c` value, for example:
 
 ```powershell
 -c 131072

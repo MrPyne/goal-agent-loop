@@ -31,6 +31,7 @@ from .models import (
 from .opencode import OpenCodeContextOverflowError, OpenCodeError, OpenCodeRunner
 from .project_registry import ProjectEntry, ProjectRegistry
 from .proposal_quality import assess_setup_proposal
+from .project_snapshot import collect_project_snapshot
 from .proposal_jobs import ProposalJobManager, StatusCallback
 from .refinement_context import build_refinement_context
 from .prompts import criteria_refinement_prompt, setup_prompt
@@ -496,7 +497,7 @@ def create_app(
 
     app = FastAPI(
         title="Goal Agent Control Center",
-        version="0.6.4",
+        version="0.6.7",
         lifespan=lifespan,
     )
     app.state.control_center = center
@@ -717,10 +718,10 @@ def create_app(
             goal = store.for_goal(goal_id)
             goals[goal_id] = _goal_paths(goal)
         return {
-            "registry": str(center.registry.path),
-            "project": str(store.project_dir),
-            "config": str(store.config_path),
-            "agent_root": str(store.root),
+            "registry": _display_path(center.registry.path),
+            "project": _display_path(store.project_dir),
+            "config": _display_path(store.config_path),
+            "agent_root": _display_path(store.root),
             "goals": goals,
         }
 
@@ -954,7 +955,10 @@ def create_app(
         session = store.read_refinement_session()
         if session.current_proposal is None:
             raise HTTPException(status_code=409, detail="No refinement proposal is available to finalize")
-        proposal = assess_setup_proposal(session.current_proposal)
+        proposal = assess_setup_proposal(
+            session.current_proposal,
+            project_path=store.read_config().project_path,
+        )
         blockers = [item for item in proposal.criteria_quality_issues if item.severity == "blocking"]
         if not request.force and (
             not proposal.ready_to_finalize or proposal.clarifying_questions or blockers
@@ -1037,6 +1041,7 @@ def create_app(
             current_session = store.read_refinement_session()
             saved_goal = store.read_goal()
             saved_criteria = store.read_criteria()
+            project_snapshot = collect_project_snapshot(config.project_path)
             prompt_context = build_refinement_context(
                 session=current_session,
                 saved_goal=saved_goal,
@@ -1054,12 +1059,18 @@ def create_app(
 
             try:
                 proposal, _ = await runner.run_structured(
-                    setup_prompt(saved_goal, prompt_context.transcript),
+                    setup_prompt(
+                        saved_goal,
+                        prompt_context.transcript,
+                        project_snapshot=project_snapshot,
+                    ),
                     SetupProposal,
                     model=control.model_override or config.model,
                     agent=config.strategist_agent,
                     title=f"Refine goal and criteria: {goal_id}",
                     status_callback=status_callback,
+                    attempts=4,
+                    profile="refinement",
                 )
             except OpenCodeContextOverflowError as first_overflow:
                 # OpenCode's own tool/file history can exhaust the provider context
@@ -1087,13 +1098,15 @@ def create_app(
                             saved_goal,
                             compact_context.transcript,
                             low_context=True,
+                            project_snapshot=project_snapshot,
                         ),
                         SetupProposal,
                         model=control.model_override or config.model,
                         agent=config.strategist_agent,
                         title=f"Refine goal and criteria (compact): {goal_id}",
                         status_callback=status_callback,
-                        attempts=1,
+                        attempts=3,
+                        profile="refinement",
                     )
                 except OpenCodeContextOverflowError as second_overflow:
                     requested = second_overflow.requested_tokens
@@ -1112,7 +1125,7 @@ def create_app(
                         "a larger context window. The refinement conversation was preserved."
                     ) from second_overflow
 
-            proposal = assess_setup_proposal(proposal)
+            proposal = assess_setup_proposal(proposal, project_path=config.project_path)
             latest = store.read_refinement_session()
             assistant_text = proposal.assistant_message.strip() or proposal.readiness_reason
             if proposal.clarifying_questions:
@@ -1188,11 +1201,17 @@ def create_app(
             context += f"\nUser feedback: {request.feedback.strip()}"
         try:
             proposal, _ = await OpenCodeRunner(config).run_structured(
-                setup_prompt(store.read_goal(), context),
+                setup_prompt(
+                    store.read_goal(),
+                    context,
+                    project_snapshot=collect_project_snapshot(config.project_path),
+                ),
                 SetupProposal,
                 model=control.model_override or config.model,
                 agent=config.strategist_agent,
                 title=f"Refine goal: {goal_id}",
+                attempts=4,
+                profile="refinement",
             )
         except OpenCodeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -1217,6 +1236,7 @@ def create_app(
                 model=control.model_override or config.model,
                 agent=config.strategist_agent,
                 title=f"Refine criteria: {goal_id}",
+                profile="analysis",
             )
         except OpenCodeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -1260,14 +1280,14 @@ async def _project_detail(runtime: ProjectRuntime) -> dict[str, Any]:
     return {
         "id": runtime.entry.id,
         "title": runtime.entry.title,
-        "project_dir": str(runtime.store.project_dir),
-        "agent_root": str(runtime.store.root),
+        "project_dir": _display_path(runtime.store.project_dir),
+        "agent_root": _display_path(runtime.store.root),
         "config": config.model_dump(mode="json"),
         "active_goal_ids": sorted(runtime.supervisor.active_goal_ids()),
         "paths": {
-            "project": str(runtime.store.project_dir),
-            "agent_root": str(runtime.store.root),
-            "config": str(runtime.store.config_path),
+            "project": _display_path(runtime.store.project_dir),
+            "agent_root": _display_path(runtime.store.root),
+            "config": _display_path(runtime.store.config_path),
         },
     }
 
@@ -1363,20 +1383,26 @@ def _goal_store(project_store: ProjectStore, goal_id: str) -> ProjectStore:
 
 def _goal_paths(store: ProjectStore) -> dict[str, str]:
     return {
-        "metadata": str(store.metadata_path),
-        "goal": str(store.goal_path),
-        "criteria": str(store.criteria_path),
-        "steering": str(store.steering_path),
-        "refinement": str(store.refinement_path),
-        "control": str(store.control_path),
-        "status": str(store.status_markdown_path),
-        "agents": str(store.agents_path),
-        "criteria_status": str(store.criteria_status_path),
-        "evaluation_analysis": str(store.evaluation_analysis_path),
-        "hypotheses": str(store.hypotheses_path),
-        "events": str(store.events_path),
-        "runs": str(store.runs_dir),
+        "metadata": _display_path(store.metadata_path),
+        "goal": _display_path(store.goal_path),
+        "criteria": _display_path(store.criteria_path),
+        "steering": _display_path(store.steering_path),
+        "refinement": _display_path(store.refinement_path),
+        "control": _display_path(store.control_path),
+        "status": _display_path(store.status_markdown_path),
+        "agents": _display_path(store.agents_path),
+        "criteria_status": _display_path(store.criteria_status_path),
+        "evaluation_analysis": _display_path(store.evaluation_analysis_path),
+        "hypotheses": _display_path(store.hypotheses_path),
+        "events": _display_path(store.events_path),
+        "runs": _display_path(store.runs_dir),
     }
+
+
+def _display_path(path: Path) -> str:
+    """Serialize filesystem paths in a platform-stable slash format for clients."""
+
+    return path.as_posix()
 
 
 async def _goal_detail(store: ProjectStore, supervisor: GoalSupervisor) -> dict[str, Any]:

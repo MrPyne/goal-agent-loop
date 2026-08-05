@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 
@@ -234,6 +235,7 @@ class GoalAgentLoop:
             title=f"Goal loop {iteration}: strategy",
             status_callback=self._agent_callback("strategist"),
             cancel_check=self._cancel_check,
+            profile="analysis",
         )
         self.store.save_run_artifact(iteration, "strategist-output.txt", strategy_result.text)
         hypothesis = Hypothesis(
@@ -277,6 +279,7 @@ class GoalAgentLoop:
             criteria=criteria,
             hypothesis=hypothesis,
             steering=steering,
+            baseline_results=before,
         )
         self.store.save_run_artifact(iteration, "executor-prompt.md", execute_prompt)
         report: ExecutionReport
@@ -289,7 +292,8 @@ class GoalAgentLoop:
                 title=f"Goal loop {iteration}: execute {hypothesis.id}",
                 status_callback=self._agent_callback("executor"),
                 cancel_check=self._cancel_check,
-                attempts=1,
+                attempts=2,
+                profile="executor",
             )
             self.store.save_run_artifact(iteration, "executor-output.txt", execution_result.text)
         except OpenCodeInterrupted:
@@ -301,6 +305,60 @@ class GoalAgentLoop:
                 blockers=[str(exc)],
             )
             self.store.save_run_artifact(iteration, "executor-output-error.txt", str(exc))
+
+        if self._should_escalate_executor_action(
+            criteria=criteria,
+            baseline_results=before,
+            report=report,
+        ):
+            escalation_directive = (
+                "The prior execution report was reconnaissance-only while required criteria still fail "
+                "because missing artifacts were identified. In this retry, run at least one artifact-producing "
+                "command from the active hypothesis plan or criterion commands (for example training/build). "
+                "If the command fails, capture the exact failing command, stderr/error, and minimum code/config "
+                "patch to unblock the next attempt. Do not stop at static inspection."
+            )
+            self.store.append_event(
+                EventRecord(
+                    type="execution_action_escalation",
+                    message="Executor retry triggered after reconnaissance-only attempt despite missing-artifact failures",
+                    data={"hypothesis_id": hypothesis.id},
+                )
+            )
+            retry_prompt = executor_prompt(
+                goal=goal,
+                criteria=criteria,
+                hypothesis=hypothesis,
+                steering=steering,
+                baseline_results=before,
+                execution_directive=escalation_directive,
+            )
+            self.store.save_run_artifact(iteration, "executor-retry-prompt.md", retry_prompt)
+            self._update_agent(
+                "executor",
+                AgentPhase.WORKING,
+                f"Retrying {hypothesis.id} with action escalation",
+                "Previous execution was reconnaissance-only; forcing artifact-producing attempt",
+            )
+            try:
+                retry_report, retry_result = await runner.run_structured(
+                    retry_prompt,
+                    ExecutionReport,
+                    model=model,
+                    agent=config.executor_agent,
+                    title=f"Goal loop {iteration}: execute {hypothesis.id} (action retry)",
+                    status_callback=self._agent_callback("executor"),
+                    cancel_check=self._cancel_check,
+                    attempts=1,
+                    profile="executor",
+                )
+                self.store.save_run_artifact(iteration, "executor-retry-output.txt", retry_result.text)
+                report = retry_report
+            except OpenCodeInterrupted:
+                raise
+            except OpenCodeError as exc:
+                self.store.save_run_artifact(iteration, "executor-retry-output-error.txt", str(exc))
+                report.blockers.append(f"Action-escalation retry failed: {exc}")
         self._update_agent(
             "executor",
             AgentPhase.COMPLETE,
@@ -477,6 +535,7 @@ class GoalAgentLoop:
                 title=f"Goal loop {self.state.iteration}: analyze {label}",
                 status_callback=self._agent_callback("evaluator"),
                 cancel_check=self._cancel_check,
+                profile="analysis",
             )
             analysis.iteration = self.state.iteration
             analysis.label = label
@@ -665,6 +724,99 @@ class GoalAgentLoop:
         self.state.phase = phase
         self.state.message = message
         self.store.save_state(self.state)
+
+    def _should_escalate_executor_action(
+        self,
+        *,
+        criteria: CriteriaDocument,
+        baseline_results: dict,
+        report: ExecutionReport,
+    ) -> bool:
+        if report.blockers and not self._is_report_format_blocker(report):
+            return False
+        if not self._has_missing_artifact_failures(criteria, baseline_results):
+            return False
+        return self._report_is_reconnaissance_only(report)
+
+    def _is_report_format_blocker(self, report: ExecutionReport) -> bool:
+        if not report.blockers:
+            return False
+        format_markers = (
+            "valid executionreport json",
+            "no proposal json object",
+            "parseable report",
+        )
+        return all(
+            any(marker in blocker.lower() for marker in format_markers)
+            for blocker in report.blockers
+        )
+
+    def _has_missing_artifact_failures(
+        self,
+        criteria: CriteriaDocument,
+        baseline_results: dict,
+    ) -> bool:
+        required_ids = {item.id for item in criteria.criteria if item.required}
+        signals = (
+            "filenotfound",
+            "not found",
+            "no such file",
+            "does not exist",
+            "cannot find",
+            "missing",
+            "checkpoint",
+            "directory not found",
+        )
+        for criterion_id, result in baseline_results.items():
+            if criterion_id not in required_ids:
+                continue
+            status = str(getattr(result, "status", "unchecked"))
+            if status == "pass":
+                continue
+            chunks = [
+                str(getattr(result, "summary", "")),
+                str(getattr(result, "error", "")),
+                " ".join(str(item) for item in (getattr(result, "evidence", None) or [])),
+            ]
+            corpus = " ".join(chunks).lower()
+            if any(token in corpus for token in signals):
+                return True
+        return False
+
+    def _report_is_reconnaissance_only(self, report: ExecutionReport) -> bool:
+        if report.files_changed:
+            return False
+        commands = [item.strip() for item in report.commands_run if str(item).strip()]
+        if not commands:
+            return True
+        return all(self._is_read_only_command(item) for item in commands)
+
+    def _is_read_only_command(self, command: str) -> bool:
+        lowered = command.strip().lower()
+        read_only_prefixes = (
+            "read ",
+            "cat ",
+            "type ",
+            "get-content ",
+            "get-childitem",
+            "dir ",
+            "ls ",
+            "test-path ",
+            "findstr ",
+            "select-string ",
+            "rg ",
+            "grep ",
+            "where ",
+            "which ",
+            "stat ",
+        )
+        if lowered.startswith(read_only_prefixes):
+            return True
+        # Treat simple listing/check pipelines as reconnaissance.
+        if re.search(r"\b(get-childitem|test-path|select-string|findstr|rg|grep|cat|type|get-content)\b", lowered):
+            if not re.search(r"\b(python|pip|pytest|npm|pnpm|yarn|cargo|go\s+test|make|cmake|dotnet|mvn|gradle|train|build|run)\b", lowered):
+                return True
+        return False
 
     def _update_agent(self, name: str, phase: AgentPhase, task: str, detail: str = "") -> None:
         agent = self.state.agents[name]

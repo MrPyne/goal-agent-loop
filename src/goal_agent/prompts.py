@@ -29,6 +29,24 @@ def _criterion_payload(criteria: CriteriaDocument) -> list[dict]:
         if item.command:
             row["command"] = _clip(item.command, 1800)
             row["expected_exit_code"] = item.expected_exit_code
+            if item.stdout_contains is not None:
+                row["stdout_contains"] = _clip(item.stdout_contains, 1000)
+            if item.stderr_contains is not None:
+                row["stderr_contains"] = _clip(item.stderr_contains, 1000)
+            if item.stdout_regex is not None:
+                row["stdout_regex"] = _clip(item.stdout_regex, 1000)
+            if item.stderr_regex is not None:
+                row["stderr_regex"] = _clip(item.stderr_regex, 1000)
+            if (
+                item.stdout_regex is not None
+                or item.stderr_regex is not None
+                or item.stdout_contains is not None
+                or item.stderr_contains is not None
+            ):
+                row["output_case_sensitive"] = item.output_case_sensitive
+            if item.output_judge_prompt:
+                row["output_judge_prompt"] = _clip(item.output_judge_prompt, 2500)
+                row["output_confidence_threshold"] = item.output_confidence_threshold
         if item.path:
             row["path"] = item.path
         if item.contains is not None:
@@ -72,20 +90,24 @@ def _analysis_payload(state: RunState) -> dict | None:
     }
 
 
-def setup_prompt(rough_goal: str, user_answers: str = "", *, low_context: bool = False) -> str:
+def setup_prompt(
+    rough_goal: str,
+    user_answers: str = "",
+    *,
+    low_context: bool = False,
+    project_snapshot: str = "",
+) -> str:
     inspection_policy = (
-        "LOW-CONTEXT RECOVERY MODE: Do not perform broad project searches. Do not inspect the project unless "
-        "the supplied goal, conversation, and draft are insufficient. If inspection is essential, inspect at most "
-        "six small, directly relevant files; never read dependency, build, cache, log, generated, or vendor trees. "
-        "Do not delegate to subagents. Return the complete proposal promptly."
+        "LOW-CONTEXT RECOVERY MODE: Use only the supplied bounded project snapshot, goal, conversation, and draft. "
+        "Do not call tools, inspect files, search the project, or delegate to subagents. Return the complete proposal promptly."
         if low_context
         else
-        "CONTEXT BUDGET: Keep project inspection narrow. Start from the supplied goal, conversation, and draft. "
-        "Inspect only directly relevant files needed to resolve a material ambiguity; avoid broad recursive searches, "
-        "dependency/build/cache/log/generated/vendor trees, large files, and unnecessary subagents."
+        "PROJECT INSPECTION: Goal Agent has already supplied a bounded read-only project snapshot. Use only that snapshot. "
+        "Do not call tools, inspect additional files, search the project, or delegate to subagents."
     )
     rough_goal = _clip(rough_goal, 8000)
     user_answers = _clip(user_answers, 24_000)
+    project_snapshot = _clip(project_snapshot, 48_000)
     return f"""
 You are an interactive goal-definition partner for a persistent autonomous AI agent loop. This is one turn in an
 ongoing refinement conversation, not a one-shot form. Read the supplied bounded conversation context, answer the
@@ -99,6 +121,14 @@ CURRENT ROUGH GOAL OR SAVED GOAL
 
 REFINEMENT CONVERSATION SO FAR
 {user_answers or '(none yet)'}
+
+BOUNDED PROJECT SNAPSHOT
+{project_snapshot or '(No project snapshot was available. Base the proposal on the saved goal and conversation.)'}
+
+RESEARCH-FIRST CRITERIA DISCOVERY
+Derive criteria from evidence in the snapshot (verification signals, docs, manifests, root layout), not from generic templates.
+When proposing a command criterion, prefer commands that are explicitly discoverable from the snapshot (for example
+existing test/build/check scripts, CI-aligned commands, or documented verification flows).
 
 Return a complete current proposal on every turn, including:
 1. refined_goal: a durable outcome statement that is specific about what must exist or work, while avoiding an
@@ -122,6 +152,8 @@ unless they are operationalized with an explicit checklist, threshold, required 
 
 Choose the strongest practical verification method:
 - command: an automated test/check exits with the expected code. Include the exact command.
+    Add stdout/stderr text or regex checks when output is part of success.
+    For qualitative command output, include output_judge_prompt with explicit PASS/FAIL rules.
 - file_exists: a specific required artifact exists at a project-relative path.
 - file_contains: a specific file contains exact text or a regex.
 - ai_judge: only for genuinely qualitative outcomes. The judge_prompt must be a strict, repeatable rubric containing
@@ -152,13 +184,18 @@ CURRENT CRITERIA
 USER FEEDBACK
 {_clip(feedback, 8000)}
 
+RESEARCH-FIRST RULE
+If feedback requests different criteria, infer revisions from concrete project evidence and verification signals,
+not from generic criterion templates.
+
 Return a complete replacement criteria list. Keep useful deterministic checks, remove redundant or gameable checks,
 and ensure all required criteria together prove that the goal is achieved. Every criterion must be atomic, binary, and
 observable, with an exact verification mechanism. Replace vague terms such as good, clear, complete, correct, robust,
 professional, user-friendly, or works with measurable thresholds, required behaviors, named artifacts, or explicit
 checklists. Prefer command/file checks whenever they truly prove the outcome. For ai_judge, write a strict judge_prompt
 that identifies the evidence to inspect and contains explicit PASS-only-if and FAIL-if rules; populate evidence_paths
-where practical. Use manual only when the user explicitly asks for a human-only approval gate. Include regression or
+where practical. For command criteria, prefer deterministic output checks and add output_judge_prompt only when
+the output requires qualitative interpretation. Use manual only when the user explicitly asks for a human-only approval gate. Include regression or
 preservation checks when a weak implementation could otherwise pass by breaking existing behavior. Criterion IDs must
 remain stable when the meaning is unchanged. Use paths relative to the project directory.
 """
@@ -215,7 +252,7 @@ def evaluation_analysis_prompt(
     return f"""
 You are the diagnostic evaluator in a persistent autonomous goal loop. The individual criteria have already been
 checked. Analyze their actual pass, fail, and error outputs so the next strategist can choose a strong root-cause
-hypothesis. You are read-only: do not modify project files.
+hypothesis. All evidence you may use is embedded below. Do not call tools, inspect files, or modify the project.
 
 OVERALL GOAL
 {_clip(goal, 8000)}
@@ -313,11 +350,10 @@ LIVE USER STEERING
 {_clip(steering, 6000)}
 
 CONTEXT DISCIPLINE
-Keep inspection narrow. Do not delegate to subagents or perform broad recursive searches. Start from exact paths,
-failing checks, and errors named above. Avoid dependency, vendor, build, cache, log, generated, media, binary, .git,
-and .goal-agent trees. Read bounded sections of only directly relevant files and return one hypothesis promptly.
+All information available to the strategist is embedded above. Do not call tools, inspect project files, delegate to
+subagents, or perform searches. Return one hypothesis promptly from the supplied criterion evidence and diagnosis.
 
-Use both the raw criterion outputs and the diagnostic analysis. Inspect the project as needed, but do not modify files.
+Use both the raw criterion outputs and the diagnostic analysis.
 Propose one root-cause hypothesis, why it is plausible, which failed criteria it targets, which passing behavior must be
 preserved, and a concrete short plan for the executor. The hypothesis must be testable this iteration.
 Avoid repeating failed approaches unless there is new evidence or a materially different implementation.
@@ -331,7 +367,42 @@ def executor_prompt(
     criteria: CriteriaDocument,
     hypothesis: Hypothesis,
     steering: str,
+    baseline_results: dict | None = None,
+    execution_directive: str = "",
 ) -> str:
+    failing_baseline: list[dict] = []
+    if baseline_results:
+        for criterion in criteria.criteria:
+            result = baseline_results.get(criterion.id)
+            if not result:
+                continue
+            status = getattr(result, "status", "unchecked")
+            passed = bool(getattr(result, "passed", False))
+            if status == "pass" or passed:
+                continue
+            evidence = getattr(result, "evidence", []) or []
+            failing_baseline.append(
+                {
+                    "id": criterion.id,
+                    "kind": criterion.kind.value,
+                    "required": criterion.required,
+                    "summary": _clip(getattr(result, "summary", ""), 1200),
+                    "error": _clip(getattr(result, "error", ""), 800) if getattr(result, "error", None) else None,
+                    "evidence": [_clip(item, 500) for item in evidence[:3]],
+                }
+            )
+
+    candidate_commands = [
+        {
+            "id": criterion.id,
+            "required": criterion.required,
+            "command": _clip(criterion.command, 1200),
+            "expected_exit_code": criterion.expected_exit_code,
+        }
+        for criterion in criteria.criteria
+        if criterion.command
+    ]
+
     return f"""
 You are the executor in a persistent autonomous goal loop. Work directly in the current project directory.
 You may inspect files, edit files, create files, and run commands needed to pursue the active hypothesis.
@@ -345,8 +416,17 @@ SUCCESS CRITERIA
 ACTIVE HYPOTHESIS
 {_clip(json.dumps(hypothesis.model_dump(mode='json'), indent=2), 9000)}
 
+BASELINE FAILURES TO RESOLVE THIS ITERATION
+{json.dumps(failing_baseline, indent=2) if failing_baseline else '(No failing baseline criteria were supplied.)'}
+
+CRITERION COMMANDS AVAILABLE
+{json.dumps(candidate_commands, indent=2) if candidate_commands else '(No command criteria are defined.)'}
+
 LIVE USER STEERING
 {_clip(steering, 6000)}
+
+SYSTEM EXECUTION DIRECTIVE
+{_clip(execution_directive, 3000) if execution_directive else '(No extra directive.)'}
 
 CONTEXT DISCIPLINE
 Work from the active hypothesis and exact evidence paths first. Do not delegate to subagents or broadly inventory the
@@ -357,5 +437,15 @@ Execute the plan rather than merely describing it. Preserve useful existing work
 finishing. Do not weaken tests or criteria simply to obtain a pass. Do not edit anything under .goal-agent unless the
 user's goal explicitly requires it. If the hypothesis is wrong, gather evidence and make the safest useful progress
 possible. End with a factual report of actions, changed files, commands, evidence, and blockers.
+
+ACTION POLICY
+- Do not end the iteration with reconnaissance-only work when the baseline failures already identify a missing
+    build artifact or executable command path.
+- If baseline failures show missing artifacts (for example file-not-found checkpoints, binaries, generated outputs),
+    attempt at least one artifact-producing command this iteration unless a concrete blocker prevents execution.
+- Prefer commands already present in ACTIVE HYPOTHESIS.plan or CRITERION COMMANDS AVAILABLE when they can directly
+    resolve a failing required criterion.
+- If execution is blocked, record the exact failing command, error, and the minimum patch needed to unblock the next
+    run. Do not stop at file listing and static inspection alone.
 """
 

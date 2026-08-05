@@ -14,6 +14,8 @@ const state = {
   aiConversation: "",
   aiSession: null,
   aiJobId: null,
+  aiLastSubmittedFeedback: "",
+  aiRetryFeedback: "",
   polling: false,
   pendingDetailRender: false,
   steeringDrafts: {},
@@ -27,6 +29,17 @@ const esc = (value = "") => String(value).replace(/[&<>'"]/g, c => ({"&":"&amp;"
 const pct = (part, total) => total ? Math.round(part * 100 / total) : 0;
 const fmtTime = value => value ? new Date(value).toLocaleString() : "—";
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function latestUserMessage(messages = []) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "user") {
+      const content = String(message.content || "").trim();
+      if (content) return content;
+    }
+  }
+  return "";
+}
 
 
 function captureSteeringDraft() {
@@ -43,10 +56,25 @@ function isEditableElement(element) {
   return !!(element && element.matches?.('input, textarea, select, [contenteditable="true"]'));
 }
 
+function isSelectionInsideMainContent() {
+  const selection = window.getSelection?.();
+  if (!selection || selection.rangeCount < 1 || selection.isCollapsed) return false;
+  const range = selection.getRangeAt(0);
+  const mainContent = $("#main-content");
+  if (!mainContent) return false;
+  const anchorNode = selection.anchorNode;
+  const focusNode = selection.focusNode;
+  return !!(
+    (anchorNode && mainContent.contains(anchorNode))
+    || (focusNode && mainContent.contains(focusNode))
+    || (range.commonAncestorContainer && mainContent.contains(range.commonAncestorContainer))
+  );
+}
+
 function isUserEditingMainContent() {
   const active = document.activeElement;
   const focusedEditor = !!(active && active.closest?.("#main-content") && isEditableElement(active));
-  return focusedEditor || Date.now() < state.interactionHoldUntil;
+  return focusedEditor || isSelectionInsideMainContent() || Date.now() < state.interactionHoldUntil;
 }
 
 function detailSignature(detail) {
@@ -300,11 +328,30 @@ function renderOverview() {
   const results = d.state.criteria_results || {};
   const required = definitions.filter(c => c.required);
   const passed = required.filter(c => results[c.id]?.passed).length;
+  const checked = Object.values(results).filter(result => result && result.status && result.status !== "unchecked").length;
+  const totalCriteria = definitions.length;
   const agents = Object.entries(d.state.agents || {});
+  const liveAgent = selectLiveAgent(d.state.agents || {});
+  const evaluatorAgent = d.state.agents?.evaluator || null;
   const activeHypothesis = [...(d.state.hypotheses || [])].reverse().find(h => h.id === d.state.active_hypothesis_id) || [...(d.state.hypotheses || [])].reverse()[0];
   const evaluationAnalysis = d.state.evaluation_analysis || null;
   return `<div class="grid two">
     <div class="grid">
+      <section class="card live-status-card ${d.control.desired_state === "running" ? "live" : ""}">
+        <div class="card-heading"><h3>Loop status</h3><span class="badge ${esc(d.state.phase)}">${esc(d.state.phase)}</span></div>
+        <div class="live-status-message">${esc(d.state.message || "No current status")}</div>
+        <div class="live-status-grid">
+          <div><span class="eyebrow">Desired state</span><div>${esc(d.control.desired_state)}</div></div>
+          <div><span class="eyebrow">Iteration</span><div>${esc(String(d.state.iteration))}</div></div>
+          <div><span class="eyebrow">Last update</span><div>${esc(fmtTime(d.state.updated_at))}</div></div>
+          <div><span class="eyebrow">Last error</span><div>${esc(d.state.last_error || "None")}</div></div>
+          <div><span class="eyebrow">Criteria checked</span><div>${esc(`${checked}/${totalCriteria}`)}</div></div>
+          <div><span class="eyebrow">Required passing</span><div>${esc(`${passed}/${required.length}`)}</div></div>
+        </div>
+        ${evaluatorAgent ? `<div class="live-status-progress"><strong>Current evaluation step</strong><p>${esc(evaluatorAgent.task || "Evaluating criteria")}</p><small>${esc(evaluatorAgent.detail || "Checking the next success criterion…")}</small></div>` : ""}
+        ${liveAgent ? `<div class="live-status-agent"><span class="eyebrow">Active agent</span><strong>${esc(liveAgent.name)}</strong><span class="badge ${esc(liveAgent.phase)}">${esc(liveAgent.phase)}</span><div>${esc(liveAgent.task || "Idle")}</div><p>${esc(liveAgent.detail || "No detailed progress yet.")}</p></div>` : ""}
+        ${d.state.phase === "running" ? `<p class="live-status-note">The loop is active. If the task looks unchanged, the current step may be evaluating criteria, waiting on OpenCode, or preparing the next hypothesis.</p>` : ""}
+      </section>
       <section class="card">
         <div class="card-heading"><h3>Goal</h3><button class="button ghost" data-tab="definition">Edit definition</button></div>
         <div class="goal-copy">${esc(d.goal)}</div>
@@ -342,6 +389,21 @@ function renderOverview() {
       </section>
     </div>
   </div>`;
+}
+
+function selectLiveAgent(agents) {
+  const values = Object.values(agents);
+  return values
+    .slice()
+    .sort((left, right) => {
+      const phaseRank = phase => phase === "working" ? 0 : phase === "waiting" ? 1 : phase === "blocked" ? 2 : phase === "error" ? 3 : 4;
+      const leftRank = phaseRank(left.phase);
+      const rightRank = phaseRank(right.phase);
+      if (leftRank !== rightRank) return leftRank - rightRank;
+      const leftTime = left.updated_at ? new Date(left.updated_at).getTime() : 0;
+      const rightTime = right.updated_at ? new Date(right.updated_at).getTime() : 0;
+      return rightTime - leftTime;
+    })[0] || null;
 }
 
 function renderEvaluationAnalysis(analysis) {
@@ -565,6 +627,7 @@ function bindGlobalEvents() {
   $("#open-project-form").addEventListener("submit", openProject);
   $("#settings-form").addEventListener("submit", saveSettings);
   $("#ai-generate").addEventListener("click", generateAIProposal);
+  $("#ai-retry-last").addEventListener("click", retryLastAIMessage);
   $("#ai-cancel").addEventListener("click", cancelAIProposal);
   $("#ai-reset").addEventListener("click", resetAIRefinement);
   $("#ai-apply").addEventListener("click", applyAIProposal);
@@ -633,6 +696,25 @@ function bindGlobalEvents() {
       state.interactionHoldUntil = Date.now() + 750;
     }
     captureSteeringDraft();
+  });
+
+  document.addEventListener("selectionchange", () => {
+    if (isSelectionInsideMainContent()) {
+      // Keep the selected text stable while polling continues in the background.
+      state.interactionHoldUntil = Date.now() + 2500;
+    }
+  });
+
+  document.addEventListener("mousedown", event => {
+    if (event.target.closest?.("#main-content")) {
+      state.interactionHoldUntil = Date.now() + 1500;
+    }
+  });
+
+  document.addEventListener("copy", event => {
+    if (event.target.closest?.("#main-content") || isSelectionInsideMainContent()) {
+      state.interactionHoldUntil = Date.now() + 2000;
+    }
   });
 }
 
@@ -941,6 +1023,8 @@ async function saveSettings(event) {
 
 async function openAI(mode) {
   state.aiMode = mode; state.aiProposal = null; state.aiConversation = ""; state.aiJobId = null; state.aiSession = null;
+  state.aiLastSubmittedFeedback = "";
+  state.aiRetryFeedback = "";
   $("#ai-modal-title").textContent = mode === "goal" ? "Finalize goal and success criteria" : "Make success criteria concrete";
   $("#ai-help").textContent = mode === "goal"
     ? "Keep replying until the questions are resolved and the AI marks the draft ready. The conversation is saved with this goal."
@@ -952,15 +1036,36 @@ async function openAI(mode) {
   $("#ai-cancel").classList.add("hidden");
   $("#ai-apply").classList.add("hidden");
   $("#ai-finalize").classList.add("hidden");
+  updateAIRetryButton();
   openModal("ai-modal");
   try {
     state.aiSession = await api(`/api/goals/${encodeURIComponent(state.selectedId)}/refinement-session`);
+    const priorUserMessage = latestUserMessage(state.aiSession?.messages || []);
+    if (priorUserMessage) state.aiLastSubmittedFeedback = priorUserMessage;
     state.aiProposal = state.aiSession.current_proposal || null;
     renderAIRefinement();
   } catch (error) {
     $("#ai-result").className = "ai-result proposal-error";
     $("#ai-result").innerHTML = `<span class="eyebrow">Could not load refinement</span><p>${esc(error.message)}</p>`;
   }
+}
+
+function updateAIRetryButton() {
+  const button = $("#ai-retry-last");
+  const fallbackRetry = latestUserMessage(state.aiSession?.messages || []);
+  const retryText = (state.aiRetryFeedback || "").trim() || (state.aiLastSubmittedFeedback || "").trim() || fallbackRetry;
+  const hasRetry = !!retryText;
+  button.disabled = !!state.aiJobId || !hasRetry;
+  if (!hasRetry) {
+    button.textContent = "Retry last failed message";
+    button.title = "Becomes available after a refinement turn fails";
+    return;
+  }
+  const preview = retryText.length > 72
+    ? `${retryText.slice(0, 69)}...`
+    : retryText;
+  button.textContent = `Retry failed message: \"${preview}\"`;
+  button.title = "Resend the last message that failed to complete";
 }
 
 function renderAIConversation() {
@@ -977,6 +1082,7 @@ function renderAIConversation() {
 
 function renderAIRefinement() {
   renderAIConversation();
+  updateAIRetryButton();
   const proposal = state.aiProposal;
   const status = state.aiSession?.status || "not_started";
   const readiness = $("#ai-readiness");
@@ -1049,8 +1155,9 @@ async function waitForAIProposal(jobId, projectId) {
   }
 }
 
-async function generateAIProposal() {
-  const feedback = $("#ai-feedback").value.trim();
+async function generateAIProposal(forcedFeedback = null) {
+  const inputValue = typeof forcedFeedback === "string" ? forcedFeedback : $("#ai-feedback").value;
+  const feedback = inputValue.trim();
   const projectId = state.projectId;
   const goalId = state.selectedId;
   const mode = state.aiMode;
@@ -1059,9 +1166,13 @@ async function generateAIProposal() {
     $("#ai-feedback").focus();
     return;
   }
+  if (feedback) {
+    state.aiLastSubmittedFeedback = feedback;
+  }
   $("#ai-working").classList.remove("hidden");
   $("#ai-cancel").classList.remove("hidden");
   $("#ai-generate").disabled = true;
+  $("#ai-retry-last").disabled = true;
   $("#ai-reset").disabled = true;
   $("#ai-working-stage").textContent = "Starting refinement turn…";
   $("#ai-working-detail").textContent = "The AI will return a complete revised draft, not just a partial answer.";
@@ -1075,8 +1186,10 @@ async function generateAIProposal() {
     state.aiSession = result.refinement_session || await api(`/api/goals/${encodeURIComponent(goalId)}/refinement-session`);
     if (state.aiSession.current_proposal) state.aiProposal = state.aiSession.current_proposal;
     $("#ai-feedback").value = "";
+    state.aiRetryFeedback = "";
     renderAIRefinement();
   } catch (error) {
+    state.aiRetryFeedback = feedback || state.aiLastSubmittedFeedback || "";
     $("#ai-result").className = "ai-result proposal-error";
     $("#ai-result").innerHTML = `<span class="eyebrow">Refinement error</span><p>${esc(error.message)}</p><p class="muted small">Your saved conversation remains available. Retry this turn after reviewing the error.</p>`;
     toast(error.message, "error");
@@ -1084,13 +1197,30 @@ async function generateAIProposal() {
       state.aiSession = await api(`/api/goals/${encodeURIComponent(goalId)}/refinement-session`);
       renderAIConversation();
     } catch (_) {}
+    updateAIRetryButton();
   } finally {
     state.aiJobId = null;
     $("#ai-working").classList.add("hidden");
     $("#ai-cancel").classList.add("hidden");
     $("#ai-generate").disabled = false;
+    $("#ai-retry-last").disabled = false;
     $("#ai-reset").disabled = false;
+    updateAIRetryButton();
   }
+}
+
+async function retryLastAIMessage() {
+  const retryFeedback = (state.aiRetryFeedback || "").trim()
+    || (state.aiLastSubmittedFeedback || "").trim()
+    || latestUserMessage(state.aiSession?.messages || []);
+  if (!retryFeedback) {
+    toast("No failed message is available to retry", "error");
+    return;
+  }
+  state.aiRetryFeedback = retryFeedback;
+  $("#ai-feedback").value = retryFeedback;
+  toast("Retrying your last message…");
+  await generateAIProposal(retryFeedback);
 }
 
 async function cancelAIProposal() {
@@ -1113,6 +1243,8 @@ async function resetAIRefinement() {
   try {
     state.aiSession = await api(`/api/goals/${encodeURIComponent(state.selectedId)}/refinement-session/reset`, { method: "POST", body: "{}" });
     state.aiProposal = null;
+    state.aiLastSubmittedFeedback = "";
+    state.aiRetryFeedback = "";
     $("#ai-feedback").value = "";
     renderAIRefinement();
     toast("Refinement conversation reset");

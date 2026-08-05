@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Goal Agent Control Center</title>
-  <link rel="stylesheet" href="/style.css?v=0.6.4">
+  <link rel="stylesheet" href="/style.css?v=0.7.1">
 </head>
 <body>
   <div id="app-shell">
@@ -213,6 +213,7 @@
             <textarea id="ai-feedback" rows="5" placeholder="Answer the questions or explain what should change. You can also say: Perform a final readiness review and make every criterion concrete."></textarea>
           </label>
           <button id="ai-generate" class="button primary full-width">Start refinement</button>
+          <button id="ai-retry-last" class="button danger full-width" type="button" disabled>Retry last failed message</button>
           <div id="ai-working" class="working ai-job-working hidden">
             <span class="spinner"></span>
             <div><strong id="ai-working-stage">OpenCode is preparing a proposal…</strong><small id="ai-working-detail">Starting…</small></div>
@@ -233,7 +234,7 @@
   </div>
 
   <div id="toast-stack" class="toast-stack"></div>
-  <script src="/app.js?v=0.6.4"></script>
-  <script src="/friendly.js?v=0.6.4"></script>
+  <script src="/app.js?v=0.7.1"></script>
+  <script src="/friendly.js?v=0.7.1"></script>
 </body>
 </html>
