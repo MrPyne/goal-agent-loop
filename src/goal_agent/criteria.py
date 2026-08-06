@@ -45,6 +45,7 @@ _TEXT_SUFFIXES = {
     ".ini", ".cfg", ".csv", ".tsv", ".py", ".js", ".jsx", ".ts", ".tsx",
     ".html", ".css", ".scss", ".java", ".kt", ".c", ".h", ".cpp", ".hpp",
     ".cs", ".go", ".rs", ".sh", ".ps1", ".bat", ".cmd", ".xml", ".sql",
+    ".log",
 }
 
 
