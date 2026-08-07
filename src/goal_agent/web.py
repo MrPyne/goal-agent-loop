@@ -895,7 +895,7 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return {"iteration": iteration, "filename": filename, "content": content}
 
-
+    @app.post("/api/goals/{goal_id}/action")
     async def goal_action(
         goal_id: str,
         request: ActionRequest,
