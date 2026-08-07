@@ -369,6 +369,69 @@ Do NOT propose re-running the same timed-out command unchanged.
 """
 
 
+def criterion_fix_prompt(
+    *,
+    goal: str,
+    criterion,  # CriterionDefinition
+    result,     # CriterionResult
+    criteria: CriteriaDocument,
+    steering: str,
+) -> str:
+    """Single-criterion executor prompt for serial fix mode.
+
+    Unlike the free-form executor_prompt, this gives the executor one concrete,
+    unambiguous mission: make THIS criterion pass.  No hypothesis needed — the
+    criterion definition and its current failure evidence are the full spec.
+    """
+    evidence_lines = "\n".join(f"  - {e}" for e in (result.evidence or [])[:8]) or "  (none)"
+    command_hint = ""
+    if criterion.command:
+        command_hint = f"\nCRITERION COMMAND (run this to verify after your fix):\n  {criterion.command}"
+    judge_hint = ""
+    if criterion.judge_prompt:
+        judge_hint = f"\nJUDGE RUBRIC:\n{_clip(criterion.judge_prompt, 2000)}"
+    elif criterion.output_judge_prompt:
+        judge_hint = f"\nOUTPUT JUDGE RUBRIC:\n{_clip(criterion.output_judge_prompt, 2000)}"
+    required_by = [c.id for c in criteria.criteria if c.required and not c.id == criterion.id]
+    return f"""
+You are the executor in a persistent autonomous goal loop operating in single-criterion fix mode.
+Your ONLY task this iteration is to make the one criterion below pass.
+Do NOT touch unrelated files, run long-running evals, or attempt to fix other criteria.
+
+OVERALL GOAL
+{_clip(goal, 4000)}
+
+TARGET CRITERION TO FIX
+ID: {criterion.id}
+Kind: {criterion.kind.value}
+Required: {criterion.required}
+Description: {criterion.description}
+{command_hint}
+{judge_hint}
+
+CURRENT FAILURE EVIDENCE
+Status: {result.status}
+Summary: {_clip(result.summary, 1200)}
+Evidence:
+{evidence_lines}
+
+LIVE USER STEERING
+{_clip(steering, 3000)}
+
+INSTRUCTIONS
+1. Inspect the failure evidence above — that is your full diagnosis.
+2. Make the MINIMUM change required to satisfy the criterion.  Prefer editing an
+   existing file over creating a new one; prefer a small targeted fix over a rewrite.
+3. If the criterion requires a COMMAND, run the command after your fix and include the
+   output in your report so the evaluator can confirm without re-running everything.
+4. If the fix requires creating a NEW SCRIPT, create it, run it, and verify it exits
+   with the expected code before reporting.
+5. Do NOT run quality_gate.py, promotion_check.py, or any eval that takes > 5 minutes —
+   those are handled by the automated criterion evaluator, not the executor.
+6. Report: files changed, commands run, exact output, and whether the criterion now passes.
+""".strip()
+
+
 def executor_prompt(
     *,
     goal: str,

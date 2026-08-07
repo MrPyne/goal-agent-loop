@@ -70,6 +70,15 @@ class AppConfig(BaseModel):
     max_iterations: int | None = None
     max_recent_hypotheses: int = 12
     no_progress_rethink_after: int = 3
+    criterion_serial_mode: bool = Field(
+        default=False,
+        description=(
+            "When True, fix criteria one at a time in declaration order rather than proposing "
+            "free-form hypotheses. Each failing required criterion is targeted individually; "
+            "once all pass, a final combined check is run. If that check reveals regressions "
+            "the serial loop restarts."
+        ),
+    )
     status_refresh_seconds: float = 0.75
     max_concurrent_goals: int = Field(default=2, ge=1, le=32)
     gui_auto_resume_running_goals: bool = True
@@ -241,6 +250,10 @@ class RunState(BaseModel):
     hypotheses: list[Hypothesis] = Field(default_factory=list)
     consecutive_no_progress: int = 0
     last_error: str | None = None
+    # Serial criterion mode: tracks the criterion currently being targeted.
+    # None  = find next failing required criterion.
+    # "__final_check__" = all passed individually; run full combined check.
+    serial_target_criterion: str | None = None
 
 
 class GoalSummary(BaseModel):

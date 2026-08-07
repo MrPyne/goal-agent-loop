@@ -32,7 +32,7 @@ from .opencode import (
     OpenCodeInterrupted,
     OpenCodeRunner,
 )
-from .prompts import evaluation_analysis_prompt, executor_prompt, strategy_prompt
+from .prompts import criterion_fix_prompt, evaluation_analysis_prompt, executor_prompt, strategy_prompt
 from .storage import ProjectStore
 
 
@@ -149,8 +149,209 @@ class GoalAgentLoop:
         finally:
             self.loop_lock.release()
 
+    # ------------------------------------------------------------------
+    # Serial criterion mode
+    # ------------------------------------------------------------------
+
+    async def _run_iteration_serial(self, config) -> None:
+        """Fix criteria one at a time, in declaration order.
+
+        Flow per iteration:
+          1. Determine the current target criterion (state.serial_target_criterion).
+          2. If target is None  → find the first failing required criterion.
+             If all pass        → set target to '__final_check__'.
+          3. If target == '__final_check__' → run full combined evaluation.
+             All pass → mark achieved.  Any fail → reset target to None (restart serial).
+          4. Otherwise → evaluate the single target criterion.
+             Pass  → advance (set target to None so next iteration finds the next failing one).
+             Fail  → run executor with a single-criterion fix directive, then re-evaluate once.
+        """
+        runner = OpenCodeRunner(config)
+        evaluator = CriteriaEvaluator(config, runner)
+        control = self.store.read_control()
+        model = control.model_override or config.model
+        goal = self.store.read_goal()
+        criteria = self.store.read_criteria()
+        steering = self.store.read_steering()
+
+        if not goal or goal.startswith("Describe the single outcome"):
+            self._set_phase(RunPhase.ERROR, "No usable goal.")
+            await asyncio.sleep(2)
+            return
+        if not criteria.criteria:
+            self._set_phase(RunPhase.ERROR, "No criteria.")
+            await asyncio.sleep(2)
+            return
+
+        self.state.iteration += 1
+        iteration = self.state.iteration
+        self._reset_agents()
+        self._set_phase(RunPhase.RUNNING, f"Iteration {iteration}: serial criterion mode")
+        self.store.append_event(EventRecord(
+            type="iteration_started",
+            message=f"Iteration {iteration} started (serial mode)",
+            data={"model": model},
+        ))
+
+        target_id = self.state.serial_target_criterion
+
+        # ── Phase A: decide / look up the target ──────────────────────
+        if target_id is None:
+            # Find the first required criterion that is not yet passing.
+            current = self.state.criteria_results
+            target_id = next(
+                (c.id for c in criteria.criteria if c.required and not (current.get(c.id) and current[c.id].passed)),
+                None,
+            )
+            if target_id is None:
+                # Every required criterion is already passing → final check.
+                self.state.serial_target_criterion = "__final_check__"
+                target_id = "__final_check__"
+            else:
+                self.state.serial_target_criterion = target_id
+            self.store.save_state(self.state)
+
+        # ── Phase B: final combined check ─────────────────────────────
+        if target_id == "__final_check__":
+            self._update_agent("evaluator", AgentPhase.WORKING, "Final combined check", "Running all criteria together")
+            before = dict(self.state.criteria_results)
+            results = await self._evaluate(
+                evaluator, criteria,
+                goal=goal, steering=steering, model=model,
+                label="Final combined check",
+                artifact_prefix="serial-final",
+                previous_results=before,
+            )
+            passing = passed_required_count(criteria.criteria, results)
+            required = sum(1 for c in criteria.criteria if c.required)
+            if all_required_pass(criteria.criteria, results):
+                self._mark_achieved(criteria)
+            else:
+                self.state.serial_target_criterion = None  # restart serial
+                self.store.append_event(EventRecord(
+                    type="serial_final_check_failed",
+                    message=f"Final combined check: {passing}/{required} required pass — restarting serial fix loop",
+                    data={k: v.model_dump(mode="json") for k, v in results.items()},
+                ))
+                self.store.save_state(self.state)
+            return
+
+        # ── Phase C: evaluate the single target criterion ─────────────
+        target_def = next((c for c in criteria.criteria if c.id == target_id), None)
+        if target_def is None:
+            self.state.serial_target_criterion = None
+            self.store.save_state(self.state)
+            return
+
+        self._update_agent("evaluator", AgentPhase.WORKING, f"Checking {target_id}", target_def.description[:120])
+        result = await evaluator.evaluate_one(
+            target_def,
+            goal=goal,
+            steering=steering,
+            model=model,
+            cancel_check=self._cancel_check,
+            status_callback=self._agent_callback("evaluator"),
+        )
+        self.state.criteria_results[target_id] = result
+        self.store.save_state(self.state)
+
+        if result.passed:
+            self.store.append_event(EventRecord(
+                type="serial_criterion_passed",
+                message=f"{target_id} now passes — advancing to next criterion",
+                data=result.model_dump(mode="json"),
+            ))
+            self.state.serial_target_criterion = None  # advance on next iteration
+            self.state.consecutive_no_progress = 0
+            self.store.save_state(self.state)
+            return
+
+        # ── Phase D: run executor to fix the failing criterion ────────
+        self.store.append_event(EventRecord(
+            type="serial_criterion_failed",
+            message=f"{target_id} fails: {result.summary[:120]}",
+            data=result.model_dump(mode="json"),
+        ))
+
+        fix_p = criterion_fix_prompt(
+            goal=goal,
+            criterion=target_def,
+            result=result,
+            criteria=criteria,
+            steering=steering,
+        )
+        self.store.save_run_artifact(iteration, f"serial-fix-{target_id}-prompt.md", fix_p)
+        self._update_agent("executor", AgentPhase.WORKING, f"Fixing {target_id}", result.summary[:120])
+
+        report: ExecutionReport
+        try:
+            report, exec_result = await runner.run_structured(
+                fix_p,
+                ExecutionReport,
+                model=model,
+                agent=config.executor_agent,
+                title=f"Iteration {iteration}: fix {target_id}",
+                status_callback=self._agent_callback("executor"),
+                cancel_check=self._cancel_check,
+                attempts=2,
+                profile="executor",
+            )
+            self.store.save_run_artifact(iteration, f"serial-fix-{target_id}-output.txt", exec_result.text)
+        except OpenCodeInterrupted:
+            raise
+        except OpenCodeError as exc:
+            report = ExecutionReport(
+                summary=f"Executor error while fixing {target_id}",
+                blockers=[str(exc)],
+            )
+            self.store.save_run_artifact(iteration, f"serial-fix-{target_id}-error.txt", str(exc))
+
+        self._update_agent("executor", AgentPhase.COMPLETE, f"Fix attempt for {target_id}", report.summary)
+        self.store.append_event(EventRecord(
+            type="serial_fix_executed",
+            message=report.summary,
+            data=report.model_dump(mode="json"),
+        ))
+
+        # ── Phase E: re-evaluate the same criterion after the fix ─────
+        self._update_agent("evaluator", AgentPhase.WORKING, f"Re-checking {target_id} after fix", "")
+        result_after = await evaluator.evaluate_one(
+            target_def,
+            goal=goal,
+            steering=steering,
+            model=model,
+            cancel_check=self._cancel_check,
+            status_callback=self._agent_callback("evaluator"),
+        )
+        self.state.criteria_results[target_id] = result_after
+
+        if result_after.passed:
+            self.store.append_event(EventRecord(
+                type="serial_criterion_passed",
+                message=f"{target_id} passes after fix — advancing",
+                data=result_after.model_dump(mode="json"),
+            ))
+            self.state.serial_target_criterion = None
+            self.state.consecutive_no_progress = 0
+        else:
+            self.store.append_event(EventRecord(
+                type="serial_criterion_still_failing",
+                message=f"{target_id} still fails after fix attempt: {result_after.summary[:120]}",
+                data=result_after.model_dump(mode="json"),
+            ))
+            self.state.consecutive_no_progress += 1
+
+        self.store.save_state(self.state)
+
+    # ------------------------------------------------------------------
+    # Standard hypothesis-driven iteration
+    # ------------------------------------------------------------------
+
     async def _run_iteration(self) -> None:
         config = self.store.read_config()
+        if config.criterion_serial_mode:
+            await self._run_iteration_serial(config)
+            return
         runner = OpenCodeRunner(config)
         evaluator = CriteriaEvaluator(config, runner)
         control = self.store.read_control()
