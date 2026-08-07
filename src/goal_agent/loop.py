@@ -361,6 +361,73 @@ class GoalAgentLoop:
             except OpenCodeError as exc:
                 self.store.save_run_artifact(iteration, "executor-retry-output-error.txt", str(exc))
                 report.blockers.append(f"Action-escalation retry failed: {exc}")
+
+        # Verification retry: when the executor applied a fix but explicitly did not
+        # re-run the script to verify it, retry immediately so the fix can be confirmed
+        # without waiting for a full criteria evaluation cycle (~45 min).
+        _UNVERIFIED_MARKERS = (
+            "not yet re-executed",
+            "fix applied but not",
+            "script fix applied",
+            "applied but not run",
+            "not re-run",
+            "needs re-run",
+            "not verified",
+            "not yet verified",
+        )
+        if report.files_changed and report.blockers and not self._is_report_format_blocker(report):
+            if any(
+                any(marker in (b or "").lower() for marker in _UNVERIFIED_MARKERS)
+                for b in report.blockers
+            ):
+                verify_directive = (
+                    "The previous execution applied a code fix but did NOT re-run the script to verify it. "
+                    "Your ONLY task this round is to run the script that was just fixed and report the output. "
+                    "Do not make any additional changes — just execute and report. "
+                    f"Files changed in previous round: {', '.join(report.files_changed[:5])}"
+                )
+                self.store.append_event(
+                    EventRecord(
+                        type="execution_verification_retry",
+                        message="Executor verification retry: fix applied but not re-executed",
+                        data={"hypothesis_id": hypothesis.id, "files": report.files_changed[:5]},
+                    )
+                )
+                verify_prompt = executor_prompt(
+                    goal=goal,
+                    criteria=criteria,
+                    hypothesis=hypothesis,
+                    steering=steering,
+                    baseline_results=before,
+                    execution_directive=verify_directive,
+                    consecutive_no_progress=self.state.consecutive_no_progress,
+                )
+                self.store.save_run_artifact(iteration, "executor-verify-prompt.md", verify_prompt)
+                self._update_agent(
+                    "executor",
+                    AgentPhase.WORKING,
+                    f"Verifying {hypothesis.id} fix",
+                    "Re-running the fixed script to confirm it works",
+                )
+                try:
+                    verify_report, verify_result = await runner.run_structured(
+                        verify_prompt,
+                        ExecutionReport,
+                        model=model,
+                        agent=config.executor_agent,
+                        title=f"Goal loop {iteration}: verify {hypothesis.id}",
+                        status_callback=self._agent_callback("executor"),
+                        cancel_check=self._cancel_check,
+                        attempts=1,
+                        profile="executor",
+                    )
+                    self.store.save_run_artifact(iteration, "executor-verify-output.txt", verify_result.text)
+                    report = verify_report
+                except OpenCodeInterrupted:
+                    raise
+                except OpenCodeError as exc:
+                    self.store.save_run_artifact(iteration, "executor-verify-output-error.txt", str(exc))
+                    report.blockers.append(f"Verification retry failed: {exc}")
         self._update_agent(
             "executor",
             AgentPhase.COMPLETE,
