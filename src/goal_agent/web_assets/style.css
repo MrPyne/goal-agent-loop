@@ -483,6 +483,23 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .agent-chat-pre { margin: 0; padding: 16px; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 0.79em; line-height: 1.6; color: var(--text); background: var(--panel); }
 .agent-chat-btn { padding: 3px 10px !important; width: 100%; }
 
+/* ── Hypothesis plan steps ────────────────────────────────── */
+.hypothesis-plan-details { margin: 10px 0 4px; }
+.hypothesis-plan-details summary { cursor: pointer; font-size: 0.82em; color: var(--muted); user-select: none; }
+.hypothesis-plan-details summary:hover { color: var(--text); }
+.hypothesis-plan-list { margin: 8px 0 0 18px; padding: 0; font-size: 0.8em; line-height: 1.6; color: var(--muted); }
+.hypothesis-plan-list li { margin-bottom: 4px; }
+
+/* ── Recent attempts list ─────────────────────────────────── */
+.attempt-details { border-top: 1px solid var(--border); padding: 6px 0; }
+.attempt-details.attempt-current > summary .attempt-id { color: var(--accent, #5b9cf6); font-weight: 700; }
+.attempt-summary { display: flex; align-items: baseline; gap: 6px; cursor: pointer; list-style: none; font-size: 0.8em; flex-wrap: wrap; }
+.attempt-summary::-webkit-details-marker { display: none; }
+.attempt-id { font-family: var(--mono); font-size: 0.9em; color: var(--muted); white-space: nowrap; }
+.attempt-headline { color: var(--text); flex: 1; min-width: 0; }
+.attempt-body { padding: 6px 0 2px 4px; font-size: 0.78em; border-left: 2px solid var(--border); margin-left: 2px; margin-top: 4px; }
+.attempt-plan, .attempt-outcome { margin: 3px 0; color: var(--muted); line-height: 1.5; }
+
 /* ── Iterative goal refinement ────────────────────────────── */
 .refinement-layout { grid-template-columns: minmax(330px, .9fr) minmax(430px, 1.35fr); align-items: stretch; }
 .refinement-chat-panel, .refinement-draft-panel { min-height: 520px; }

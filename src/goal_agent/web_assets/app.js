@@ -373,11 +373,18 @@ function renderOverview() {
     </div>
     <div class="grid">
       <section class="card">
-        <div class="card-heading"><h3>Current hypothesis</h3>${activeHypothesis ? `<span class="badge ${esc(activeHypothesis.status)}">${esc(activeHypothesis.status)}</span>` : ""}</div>
-        ${activeHypothesis ? `<div class="hypothesis-title">${esc(activeHypothesis.statement)}</div>
-          <p class="hypothesis-outcome">${esc(activeHypothesis.rationale)}</p>
-          <p class="hypothesis-outcome"><strong>Expected:</strong> ${esc(activeHypothesis.expected_impact)}</p>
-          <p class="hypothesis-outcome"><strong>Outcome:</strong> ${esc(activeHypothesis.outcome || "Pending")}</p>` : `<div class="muted small">The strategist has not proposed a hypothesis yet.</div>`}
+        <div class="card-heading"><h3>Current hypothesis</h3>${activeHypothesis ? `<span class="badge ${esc(activeHypothesis.status)}">${esc(activeHypothesis.status)}</span>` : ""}${d.state.serial_target_criterion && d.state.serial_target_criterion !== "__final_check__" ? `<span class="badge working" style="margin-left:6px">fixing: ${esc(d.state.serial_target_criterion)}</span>` : d.state.serial_target_criterion === "__final_check__" ? `<span class="badge" style="margin-left:6px">final combined check</span>` : ""}</div>
+        ${activeHypothesis ? `
+          <div class="hypothesis-title">${esc(activeHypothesis.statement)}</div>
+          <p class="hypothesis-outcome muted small">${esc(activeHypothesis.rationale)}</p>
+          ${activeHypothesis.plan?.length ? `<details class="hypothesis-plan-details" open><summary><strong>Plan (${activeHypothesis.plan.length} steps)</strong></summary><ol class="hypothesis-plan-list">${activeHypothesis.plan.map(step => `<li>${esc(step)}</li>`).join("")}</ol></details>` : ""}
+          <p class="hypothesis-outcome" style="margin-top:8px"><strong>Expected:</strong> ${esc(activeHypothesis.expected_impact)}</p>
+          <p class="hypothesis-outcome"><strong>Outcome:</strong> ${esc(activeHypothesis.outcome || "Pending")}</p>
+        ` : `<div class="muted small">The strategist has not proposed a hypothesis yet.</div>`}
+      </section>
+      <section class="card">
+        <div class="card-heading"><h3>Recent attempts</h3><button class="button ghost" data-tab="history">View all</button></div>
+        ${renderRecentHypotheses(d.state.hypotheses || [], d.state.active_hypothesis_id)}
       </section>
       ${renderEvaluationAnalysis(evaluationAnalysis)}
       <section class="card">
@@ -406,6 +413,27 @@ function selectLiveAgent(agents) {
       const rightTime = right.updated_at ? new Date(right.updated_at).getTime() : 0;
       return rightTime - leftTime;
     })[0] || null;
+}
+
+function renderRecentHypotheses(hypotheses, activeId) {
+  const recent = [...hypotheses].reverse().slice(0, 5);
+  if (!recent.length) return `<div class="muted small">No attempts yet.</div>`;
+  return recent.map(h => {
+    const isCurrent = h.id === activeId;
+    const statusColor = h.status === "supported" || h.status === "active" ? "working" : h.status === "refuted" ? "fail" : h.status === "achieved" ? "pass" : "";
+    const outcomeText = h.outcome ? h.outcome.replace(/\n/g, " ").slice(0, 160) + (h.outcome.length > 160 ? "…" : "") : "Pending";
+    return `<details class="attempt-details${isCurrent ? " attempt-current" : ""}">
+      <summary class="attempt-summary">
+        <span class="attempt-id">${esc(h.id)}</span>
+        <span class="badge ${statusColor}" style="font-size:0.7em">${esc(h.status)}</span>
+        <span class="attempt-headline">${esc(h.statement.slice(0, 80))}${h.statement.length > 80 ? "…" : ""}</span>
+      </summary>
+      <div class="attempt-body">
+        ${h.plan?.length ? `<p class="attempt-plan"><strong>Plan:</strong> ${esc(h.plan.slice(0, 3).join(" → "))}${h.plan.length > 3 ? ` (+${h.plan.length - 3} more)` : ""}</p>` : ""}
+        <p class="attempt-outcome"><strong>Outcome:</strong> ${esc(outcomeText)}</p>
+      </div>
+    </details>`;
+  }).join("");
 }
 
 function renderEvaluationAnalysis(analysis) {
