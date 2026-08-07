@@ -425,6 +425,8 @@ function renderEvaluationAnalysis(analysis) {
 function criterionStatus(c, result) {
   const status = result?.status || "unchecked";
   const summary = result?.summary || "Not checked";
+  const isTimeout = status === "timeout";
+  const timeoutNote = isTimeout ? ` <span class="timeout-note" title="This criterion command took longer than its configured timeout. The evaluator aborted it to avoid blocking the loop. Consider increasing timeout_seconds in the criterion definition.">⏱ timed out</span>` : "";
   return `<article class="criterion-status">
     <div class="criterion-header">
       <div><span class="criterion-id">${esc(c.id)}</span>${c.required ? ` <span class="badge">required</span>` : ""}</div>
@@ -437,7 +439,7 @@ function criterionStatus(c, result) {
       </div>
     </div>
     <div class="criterion-description">${esc(c.description)}</div>
-    <div class="criterion-summary">${esc(summary)}${result?.evaluation_method ? ` <span class="evaluation-method">${esc(result.evaluation_method.replaceAll("_", " "))}</span>` : ""}${result?.evidence?.length ? ` · ${esc(result.evidence.slice(0,2).join("; "))}` : ""}</div>
+    <div class="criterion-summary">${esc(summary)}${timeoutNote}${result?.evaluation_method ? ` <span class="evaluation-method">${esc(result.evaluation_method.replaceAll("_", " "))}</span>` : ""}${result?.evidence?.length ? ` · ${esc(result.evidence.slice(0,2).join("; "))}` : ""}</div>
   </article>`;
 }
 

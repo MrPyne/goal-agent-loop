@@ -195,7 +195,7 @@ class CriteriaEvaluator:
                 return CriterionResult(
                     criterion_id=criterion.id,
                     passed=False,
-                    status="error",
+                    status="timeout",
                     summary=f"Command timed out after {timeout}s",
                     evidence=[criterion.command],
                 )

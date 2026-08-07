@@ -127,6 +127,8 @@ button { cursor: pointer; }
 .badge.running, .badge.working, .badge.pass, .badge.achieved { color: var(--green); border-color: rgba(69,209,154,.3); background: rgba(69,209,154,.08); }
 .badge.paused, .badge.waiting, .badge.unchecked { color: var(--yellow); border-color: rgba(240,199,94,.3); background: rgba(240,199,94,.08); }
 .badge.error, .badge.fail, .badge.stopped { color: var(--red); border-color: rgba(255,110,125,.3); background: rgba(255,110,125,.08); }
+.badge.timeout { color: #92400e; border-color: rgba(245,158,11,.4); background: rgba(245,158,11,.12); }
+.timeout-note { color: #b45309; font-size: 0.78em; font-weight: 500; cursor: help; }
 .badge.idle, .badge.complete { color: var(--blue); border-color: rgba(98,184,255,.3); background: rgba(98,184,255,.08); }
 .quiet-pill { padding: 7px 10px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); font-size: 11px; }
 .state-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }

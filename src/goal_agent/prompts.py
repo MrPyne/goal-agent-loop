@@ -358,6 +358,14 @@ Propose one root-cause hypothesis, why it is plausible, which failed criteria it
 preserved, and a concrete short plan for the executor. The hypothesis must be testable this iteration.
 Avoid repeating failed approaches unless there is new evidence or a materially different implementation.
 When progress has stalled, step back and challenge assumptions rather than making cosmetic changes.
+
+TIMEOUT SELF-HEALING RULE
+If any criterion has status "timeout" or if the executor has been blocked by timeouts for multiple iterations,
+the hypothesis MUST address the timeout as a first-class problem. Propose one of:
+- Adding progress output to the long-running script so the executor can see it is alive (e.g. print per-sample progress)
+- Reducing the eval scope temporarily (smaller max_rows or a subset flag) to verify the command works
+- Caching or pre-computing results to avoid re-running the full eval every iteration
+Do NOT propose re-running the same timed-out command unchanged.
 """
 
 
@@ -408,10 +416,13 @@ def executor_prompt(
     # command criteria so the model cannot fall back to pure reconnaissance.
     forced_first_action = ""
     if consecutive_no_progress >= 2:
-        # Prefer the first concrete command criterion that is currently failing.
+        # Prefer the first concrete command criterion that is currently failing AND is not a
+        # long-running gate (timeout_seconds > 300 means it can't complete inside a single
+        # executor OpenCode session without triggering the stall detector).
         first_command: str | None = None
         for criterion in criteria.criteria:
-            if criterion.command and criterion.required:
+            cmd_timeout = criterion.timeout_seconds or 0
+            if criterion.command and criterion.required and cmd_timeout <= 300:
                 first_command = criterion.command
                 break
         # Also try to pull the first non-inspection plan step (contains 'run', 'create', 'fix', 'execute').
