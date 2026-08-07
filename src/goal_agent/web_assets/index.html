@@ -234,6 +234,30 @@
   </div>
 
   <div id="toast-stack" class="toast-stack"></div>
+
+  <!-- Agent Chat Modal -->
+  <div id="agent-chat-modal" class="modal-backdrop hidden">
+    <section class="modal wide-modal agent-chat-panel">
+      <div class="modal-header">
+        <div>
+          <span class="eyebrow" id="agent-chat-eyebrow">Agent</span>
+          <h2 id="agent-chat-title">Chat History</h2>
+          <p class="modal-subtitle" id="agent-chat-subtitle">Prompts sent to and outputs received from this agent</p>
+        </div>
+        <button class="icon-button modal-close" data-close="agent-chat-modal" aria-label="Close">&#215;</button>
+      </div>
+      <div class="agent-chat-toolbar">
+        <select id="agent-chat-iter-select" style="max-width:220px"></select>
+        <select id="agent-chat-file-select" style="max-width:280px"></select>
+        <button class="button ghost compact" id="agent-chat-refresh">&#8635; Refresh</button>
+        <label class="checkbox-row" style="margin:0 0 0 auto"><input type="checkbox" id="agent-chat-auto-refresh"> Auto-refresh</label>
+      </div>
+      <div id="agent-chat-content" class="agent-chat-content">
+        <p class="muted small" style="padding:16px">Select an iteration and file above to view its content.</p>
+      </div>
+    </section>
+  </div>
+
   <script src="/app.js?v=0.7.1"></script>
   <script src="/friendly.js?v=0.7.1"></script>
 </body>

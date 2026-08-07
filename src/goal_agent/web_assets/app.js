@@ -18,6 +18,7 @@ const state = {
   aiRetryFeedback: "",
   polling: false,
   pendingDetailRender: false,
+  agentChat: { goalId: null, agentName: null, autoRefresh: false, refreshTimer: null, runs: [] },
   steeringDrafts: {},
   lastDetailSignature: null,
   interactionHoldUntil: 0,
@@ -361,6 +362,7 @@ function renderOverview() {
           <div class="agent-top"><span class="agent-name">${esc(name)}</span><span class="badge ${esc(agent.phase)}">${esc(agent.phase)}</span></div>
           <div class="agent-task">${esc(agent.task)}</div>
           <div class="agent-detail">${esc(agent.detail || "No current detail")}</div>
+          <button class="button ghost agent-chat-btn" data-agent="${esc(name)}" style="margin-top:8px;font-size:0.78em">View chat \u2192</button>
         </article>`).join("")}
       </section>
       <section class="card">
@@ -1319,3 +1321,158 @@ async function deleteGoal() {
 }
 
 boot().catch(error => toast(error.message, "error"));
+
+// ─── Agent Chat Modal ─────────────────────────────────────────────────────────
+
+const AGENT_FILE_HINTS = {
+  strategist: ["strategist-prompt.md", "strategist-output.txt"],
+  executor:   ["executor-prompt.md", "executor-output.txt", "serial-fix-", "executor-verify-output.txt", "executor-retry-output.txt"],
+  evaluator:  ["baseline-analysis-prompt.md", "baseline-analysis-output.txt", "post-execution-analysis-output.txt"],
+};
+
+function agentFileScore(name, agentName) {
+  const hints = AGENT_FILE_HINTS[agentName] || [];
+  for (let i = 0; i < hints.length; i++) {
+    if (name.startsWith(hints[i]) || name.includes(hints[i])) return hints.length - i;
+  }
+  return -1;
+}
+
+async function openAgentChat(agentName) {
+  const d = state.detail;
+  if (!d) return;
+  const goalId = d.metadata?.id || state.selectedId;
+  state.agentChat.goalId = goalId;
+  state.agentChat.agentName = agentName;
+
+  const modal = $("#agent-chat-modal");
+  modal.classList.remove("hidden");
+  $("#agent-chat-eyebrow").textContent = agentName.charAt(0).toUpperCase() + agentName.slice(1) + " agent";
+  $("#agent-chat-title").textContent = "Chat history";
+  const subtitle = d.state?.agents?.[agentName];
+  $("#agent-chat-subtitle").textContent = subtitle ? `${subtitle.phase} — ${subtitle.task || "Idle"}` : "";
+
+  await loadAgentChatRuns();
+}
+
+async function loadAgentChatRuns() {
+  const { goalId, agentName } = state.agentChat;
+  if (!goalId) return;
+  const qs = state.projectId ? `?project_id=${encodeURIComponent(state.projectId)}` : "";
+  let data;
+  try {
+    data = await api.get(`/api/goals/${encodeURIComponent(goalId)}/runs${qs}`, { limit: 10 });
+  } catch { return; }
+  state.agentChat.runs = data.runs || [];
+
+  const iterSel = $("#agent-chat-iter-select");
+  const prevIter = iterSel.value;
+  iterSel.innerHTML = state.agentChat.runs.map(r =>
+    `<option value="${esc(r.iteration)}">${esc(r.iteration)}</option>`).join("");
+  if (prevIter && [...iterSel.options].some(o => o.value === prevIter)) iterSel.value = prevIter;
+
+  await loadAgentChatFiles();
+}
+
+async function loadAgentChatFiles() {
+  const { agentName, runs } = state.agentChat;
+  const iterSel = $("#agent-chat-iter-select");
+  const iteration = iterSel.value;
+  if (!iteration) return;
+
+  const run = runs.find(r => r.iteration === iteration);
+  const files = run ? run.files : [];
+
+  // Sort: agent-relevant files first, then everything else alphabetically
+  const sorted = [...files].sort((a, b) => {
+    const sa = agentFileScore(a, agentName), sb = agentFileScore(b, agentName);
+    if (sa !== sb) return sb - sa;
+    return a.localeCompare(b);
+  });
+
+  const fileSel = $("#agent-chat-file-select");
+  const prevFile = fileSel.value;
+  fileSel.innerHTML = sorted.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join("");
+  // Auto-select best match for this agent
+  const best = sorted.find(f => agentFileScore(f, agentName) >= 0) || sorted[0];
+  if (prevFile && sorted.includes(prevFile)) fileSel.value = prevFile;
+  else if (best) fileSel.value = best;
+
+  await loadAgentChatArtifact();
+}
+
+async function loadAgentChatArtifact() {
+  const { goalId } = state.agentChat;
+  const iteration = $("#agent-chat-iter-select")?.value;
+  const filename = $("#agent-chat-file-select")?.value;
+  if (!goalId || !iteration || !filename) return;
+
+  const contentEl = $("#agent-chat-content");
+  contentEl.innerHTML = `<p class="muted small" style="padding:16px">Loading…</p>`;
+
+  const qs = state.projectId ? `?project_id=${encodeURIComponent(state.projectId)}` : "";
+  let data;
+  try {
+    data = await api.get(`/api/goals/${encodeURIComponent(goalId)}/runs/${encodeURIComponent(iteration)}/${encodeURIComponent(filename)}${qs}`);
+  } catch (err) {
+    contentEl.innerHTML = `<p class="muted small" style="padding:16px;color:var(--red)">Error: ${esc(err.message)}</p>`;
+    return;
+  }
+
+  const raw = data.content || "";
+  const isMarkdown = filename.endsWith(".md");
+  const isJson = filename.endsWith(".json") || raw.trimStart().startsWith("{") || raw.trimStart().startsWith("[");
+
+  // Strip GOAL_AGENT_JSON wrappers for readability
+  const display = raw.replace(/<GOAL_AGENT_JSON>/g, "").replace(/<\/GOAL_AGENT_JSON>/g, "").trim();
+
+  contentEl.innerHTML = `
+    <div class="agent-chat-meta">
+      <span class="muted small">${esc(iteration)} / ${esc(filename)}</span>
+      <span class="muted small">${display.length.toLocaleString()} chars</span>
+    </div>
+    <pre class="agent-chat-pre">${esc(display)}</pre>`;
+}
+
+function startAgentChatAutoRefresh() {
+  stopAgentChatAutoRefresh();
+  state.agentChat.refreshTimer = setInterval(async () => {
+    if ($("#agent-chat-modal").classList.contains("hidden")) {
+      stopAgentChatAutoRefresh();
+      return;
+    }
+    await loadAgentChatRuns();
+  }, 3000);
+}
+
+function stopAgentChatAutoRefresh() {
+  if (state.agentChat.refreshTimer) {
+    clearInterval(state.agentChat.refreshTimer);
+    state.agentChat.refreshTimer = null;
+  }
+}
+
+// Wire up agent chat modal events
+document.addEventListener("click", async (evt) => {
+  const btn = evt.target.closest(".agent-chat-btn");
+  if (btn) { await openAgentChat(btn.dataset.agent); return; }
+
+  const close = evt.target.closest("[data-close='agent-chat-modal']");
+  if (close || evt.target.id === "agent-chat-modal") {
+    $("#agent-chat-modal").classList.add("hidden");
+    stopAgentChatAutoRefresh();
+  }
+}, true);
+
+document.addEventListener("change", async (evt) => {
+  if (evt.target.id === "agent-chat-iter-select") await loadAgentChatFiles();
+  if (evt.target.id === "agent-chat-file-select") await loadAgentChatArtifact();
+  if (evt.target.id === "agent-chat-auto-refresh") {
+    state.agentChat.autoRefresh = evt.target.checked;
+    evt.target.checked ? startAgentChatAutoRefresh() : stopAgentChatAutoRefresh();
+  }
+}, true);
+
+document.addEventListener("click", async (evt) => {
+  if (evt.target.id === "agent-chat-refresh") await loadAgentChatRuns();
+}, true);

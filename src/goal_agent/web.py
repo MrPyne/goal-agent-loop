@@ -848,7 +848,54 @@ def create_app(
         store.append_event(EventRecord(type="user_steering", message=request.message))
         return {"steering": store.read_steering()}
 
-    @app.post("/api/goals/{goal_id}/action")
+    @app.get("/api/goals/{goal_id}/runs")
+    async def list_runs(
+        goal_id: str,
+        project_id: str | None = Query(default=None),
+        limit: int = Query(default=5, ge=1, le=50),
+    ) -> dict[str, Any]:
+        """Return a summary of recent iteration run artifacts."""
+        runtime = await center.runtime(project_id)
+        store = _goal_store(runtime.store, goal_id)
+        runs_dir = store.runs_dir
+        if not runs_dir.exists():
+            return {"runs": []}
+        iterations = sorted(
+            [d for d in runs_dir.iterdir() if d.is_dir()],
+            key=lambda d: d.name,
+            reverse=True,
+        )[:limit]
+        runs = []
+        for d in reversed(iterations):
+            files = sorted(f.name for f in d.iterdir() if f.is_file())
+            runs.append({"iteration": d.name, "files": files})
+        return {"runs": runs}
+
+    @app.get("/api/goals/{goal_id}/runs/{iteration}/{filename:path}")
+    async def get_run_artifact(
+        goal_id: str,
+        iteration: str,
+        filename: str,
+        project_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """Return the text content of a specific run artifact."""
+        runtime = await center.runtime(project_id)
+        store = _goal_store(runtime.store, goal_id)
+        # Validate iteration name to prevent path traversal
+        if not iteration.startswith("iteration-") or "/" in iteration or ".." in iteration:
+            raise HTTPException(status_code=400, detail="Invalid iteration name")
+        if ".." in filename or filename.startswith("/"):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        path = store.runs_dir / iteration / filename
+        if not path.exists() or not path.is_file():
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"iteration": iteration, "filename": filename, "content": content}
+
+
     async def goal_action(
         goal_id: str,
         request: ActionRequest,
