@@ -1358,10 +1358,9 @@ async function openAgentChat(agentName) {
 async function loadAgentChatRuns() {
   const { goalId, agentName } = state.agentChat;
   if (!goalId) return;
-  const qs = state.projectId ? `?project_id=${encodeURIComponent(state.projectId)}` : "";
   let data;
   try {
-    data = await api.get(`/api/goals/${encodeURIComponent(goalId)}/runs${qs}`, { limit: 10 });
+    data = await api(`/api/goals/${encodeURIComponent(goalId)}/runs?limit=10`);
   } catch { return; }
   state.agentChat.runs = data.runs || [];
 
@@ -1408,12 +1407,11 @@ async function loadAgentChatArtifact() {
   if (!goalId || !iteration || !filename) return;
 
   const contentEl = $("#agent-chat-content");
-  contentEl.innerHTML = `<p class="muted small" style="padding:16px">Loading…</p>`;
+  contentEl.innerHTML = `<p class="muted small" style="padding:16px">Loading\u2026</p>`;
 
-  const qs = state.projectId ? `?project_id=${encodeURIComponent(state.projectId)}` : "";
   let data;
   try {
-    data = await api.get(`/api/goals/${encodeURIComponent(goalId)}/runs/${encodeURIComponent(iteration)}/${encodeURIComponent(filename)}${qs}`);
+    data = await api(`/api/goals/${encodeURIComponent(goalId)}/runs/${encodeURIComponent(iteration)}/${encodeURIComponent(filename)}`);
   } catch (err) {
     contentEl.innerHTML = `<p class="muted small" style="padding:16px;color:var(--red)">Error: ${esc(err.message)}</p>`;
     return;
