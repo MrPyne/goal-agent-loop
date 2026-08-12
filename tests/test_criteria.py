@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -79,6 +81,65 @@ def test_command_criterion_supports_stdout_and_regex_checks(tmp_path: Path) -> N
 
     assert result.passed
     assert any("stdout matched" in evidence for evidence in result.evidence)
+
+
+def test_named_external_benchmark_requires_official_provenance(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "livebench_results.json").write_text(
+        json.dumps({"score_valid": True, "metrics": {"overall_score": 0.99}}),
+        encoding="utf-8",
+    )
+    config = AppConfig(project_dir=str(tmp_path), poll_interval_seconds=0.01)
+    evaluator = CriteriaEvaluator(config, DummyRunner())  # type: ignore[arg-type]
+    criterion = CriterionDefinition(
+        id="livebench_score",
+        description="The model scores at least 70% on LiveBench.",
+        kind=CriterionKind.COMMAND,
+        command=f'"{sys.executable}" -c "print(123)"',
+    )
+
+    result = asyncio.run(evaluator.evaluate_one(criterion, goal="g", steering="", model=None))
+
+    assert not result.passed
+    assert "official-run provenance" in result.summary
+
+
+def test_named_external_benchmark_accepts_hashed_official_artifact(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    scripts = tmp_path / "scripts"
+    logs.mkdir()
+    scripts.mkdir()
+    raw = logs / "livebench_raw.jsonl"
+    raw.write_text('{"sample":"official result"}\n', encoding="utf-8")
+    (scripts / "run_livebench.py").write_text("# official runner adapter\n", encoding="utf-8")
+    (logs / "livebench_results.json").write_text(
+        json.dumps(
+            {
+                "score_valid": True,
+                "metrics": {"overall_score": 0.99},
+                "provenance": {
+                    "official_source": "https://github.com/livebench/livebench",
+                    "dataset_revision": "2025-02-01",
+                    "raw_results_path": "logs/livebench_raw.jsonl",
+                    "raw_results_sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = AppConfig(project_dir=str(tmp_path), poll_interval_seconds=0.01)
+    evaluator = CriteriaEvaluator(config, DummyRunner())  # type: ignore[arg-type]
+    criterion = CriterionDefinition(
+        id="livebench_score",
+        description="The model scores at least 70% on LiveBench.",
+        kind=CriterionKind.COMMAND,
+        command=f'"{sys.executable}" scripts/run_livebench.py',
+    )
+
+    result = asyncio.run(evaluator.evaluate_one(criterion, goal="g", steering="", model=None))
+
+    assert result.passed
 
 
 def test_all_required_pass_requires_at_least_one_required() -> None:

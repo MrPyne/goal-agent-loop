@@ -14,25 +14,37 @@ from .criteria import (
     passed_required_count,
 )
 from .models import (
+    AgentActivity,
     AgentPhase,
+    apply_criteria_revision,
     CriteriaDocument,
+    CriterionDefinition,
     CriterionAnalysis,
     EvaluationAnalysis,
     EventRecord,
     ExecutionReport,
     Hypothesis,
+    is_named_external_benchmark,
     RunPhase,
     RunState,
+    SerialCriterionDiagnosis,
     StrategyDecision,
     utc_now,
 )
 from .opencode import (
     OpenCodeContextOverflowError,
     OpenCodeError,
+    GOAL_AGENT_EXECUTOR_AGENT,
     OpenCodeInterrupted,
     OpenCodeRunner,
 )
-from .prompts import criterion_fix_prompt, evaluation_analysis_prompt, executor_prompt, strategy_prompt
+from .prompts import (
+    criterion_fix_prompt,
+    evaluation_analysis_prompt,
+    executor_prompt,
+    serial_criterion_diagnosis_prompt,
+    strategy_prompt,
+)
 from .storage import ProjectStore
 
 
@@ -47,6 +59,61 @@ class GoalAgentLoop:
         self.state = store.load_state()
         self._last_status_write = 0.0
 
+    @staticmethod
+    def _criteria_revision_admission_error(
+        criterion: CriterionDefinition,
+        diagnosis: SerialCriterionDiagnosis,
+    ) -> str | None:
+        """Return why a strategist's proposed criteria edit is not admissible.
+
+        A model must not turn an actionable runner/output/provenance failure into
+        a review pause by labelling a concrete target ``not_meaningful``.  This
+        deliberately checks the *existing* criterion rather than trusting the
+        proposed replacement.
+        """
+
+        suggestion = diagnosis.criteria_revision
+        if suggestion is None:
+            return None
+        reason = suggestion.revision_reason
+        if reason is None:
+            return (
+                "it did not identify one of the four allowed reasons "
+                "(not meaningful, unachievable, contradictory, or duplicate)"
+            )
+
+        if is_named_external_benchmark(criterion):
+            return (
+                "a named external benchmark is implementation work; strategist proposals cannot "
+                "weaken, remove, or replace its criterion. Repair the official runner, adapter, "
+                "data, scorer, and raw evidence instead"
+            )
+
+        description = criterion.description.lower()
+        has_explicit_outcome = bool(
+            re.search(
+                r"\b(?:at least|at most|exactly|no more than|must|pass only if|"
+                r"score|accuracy|pass[ -]?rate|success[ -]?rate)\b",
+                description,
+            )
+        )
+        if reason == "not_meaningful" and has_explicit_outcome:
+            return (
+                "the existing criterion already defines a concrete observable outcome; "
+                "a runner, output-format, provenance, dataset, or regex problem is implementation work"
+            )
+        if reason == "duplicate" and not suggestion.remove_target:
+            return "a duplicate criterion must be removed, not replaced with a different proxy"
+        if reason == "contradictory":
+            other_ids = [
+                item.id for item in diagnosis.criteria_revision.proposed_criteria
+                if item.id != criterion.id
+            ]
+            rationale = suggestion.rationale.lower()
+            if not other_ids and "criterion" not in rationale:
+                return "the claimed contradiction does not identify the incompatible current criterion"
+        return None
+
     async def run_forever(self) -> RunState:
         try:
             self.loop_lock.acquire(timeout=0)
@@ -60,6 +127,7 @@ class GoalAgentLoop:
             self.state.ended_at = None
             self.state.last_error = None
             self.store.append_event(EventRecord(type="loop_started", message="Agent loop started"))
+            was_paused = False
             while True:
                 control = self._read_control_safely()
                 if control is None:
@@ -69,9 +137,19 @@ class GoalAgentLoop:
                     self._set_phase(RunPhase.STOPPED, "Stopped by user")
                     break
                 if control.desired_state.value == "paused":
+                    was_paused = True
                     self._set_phase(RunPhase.PAUSED, "Paused; waiting for desired_state: running")
                     await asyncio.sleep(1)
                     continue
+
+                if was_paused:
+                    # Dashboard actions (such as applying a review-required
+                    # criterion revision) update persistent state while this
+                    # long-lived loop is waiting. Reload before the next
+                    # iteration so the stale in-memory copy cannot restore a
+                    # suggestion that the user just approved and cleared.
+                    self.state = self.store.load_state()
+                    was_paused = False
 
                 try:
                     await self._run_iteration()
@@ -243,6 +321,61 @@ class GoalAgentLoop:
             self.store.save_state(self.state)
             return
 
+        # A serial target stays selected until it passes, so without an explicit
+        # escape hatch the loop can spend every iteration re-running an expensive
+        # deterministic check after the executor has failed to make progress. The
+        # first threshold activates the constrained recovery profile. If that is
+        # also exhausted, return to a fresh diagnosis cycle automatically: missing
+        # project infrastructure (a runner, dataset, adapter, or scorer) remains
+        # executor work and must not require the user to invent the next step.
+        if self.state.serial_consecutive_no_progress >= config.no_progress_rethink_after:
+            attempts = self.state.serial_consecutive_no_progress
+            if not self.state.serial_strict_recovery:
+                note = (
+                    f"{target_id} made no measurable progress after {attempts} attempts; "
+                    "automatically escalating to strict implementation recovery."
+                )
+                self.state.consecutive_no_progress = 0
+                self.state.serial_consecutive_no_progress = 0
+                self.state.serial_strict_recovery = True
+                self._reset_agents()
+                self._set_phase(RunPhase.RUNNING, note)
+                self.store.append_event(
+                    EventRecord(
+                        type="serial_stall_escalated",
+                        message=note,
+                        data={
+                            "criterion_id": target_id,
+                            "no_progress_attempts": attempts,
+                            "iteration": iteration,
+                        },
+                    )
+                )
+                self.store.save_state(self.state)
+                return
+            note = (
+                f"{target_id} remained failing after {attempts} strict implementation recovery "
+                "attempts; automatically returning to a fresh diagnosis and implementation cycle."
+            )
+            self.state.consecutive_no_progress = 0
+            self.state.serial_consecutive_no_progress = 0
+            self.state.serial_strict_recovery = False
+            self._reset_agents()
+            self._set_phase(RunPhase.RUNNING, note)
+            self.store.append_event(
+                EventRecord(
+                    type="serial_stall_replanned",
+                    message=note,
+                    data={
+                        "criterion_id": target_id,
+                        "no_progress_attempts": attempts,
+                        "iteration": iteration,
+                    },
+                )
+            )
+            self.store.save_state(self.state)
+            return
+
         self._update_agent("evaluator", AgentPhase.WORKING, f"Checking {target_id}", target_def.description[:120])
         result = await evaluator.evaluate_one(
             target_def,
@@ -263,6 +396,8 @@ class GoalAgentLoop:
             ))
             self.state.serial_target_criterion = None  # advance on next iteration
             self.state.consecutive_no_progress = 0
+            self.state.serial_consecutive_no_progress = 0
+            self.state.serial_strict_recovery = False
             self.store.save_state(self.state)
             return
 
@@ -273,33 +408,206 @@ class GoalAgentLoop:
             data=result.model_dump(mode="json"),
         ))
 
+        # Serial mode otherwise has no strategist phase. Diagnose whether the
+        # command is a faithful proxy for the criterion before asking the
+        # executor to repeat a narrow fix attempt.
+        diagnosis_prompt = serial_criterion_diagnosis_prompt(
+            goal=goal,
+            criterion=target_def,
+            result=result,
+            criteria=criteria,
+            criteria_results=self.state.criteria_results,
+            steering=steering,
+        )
+        self.store.save_run_artifact(
+            iteration, f"serial-diagnosis-{target_id}-prompt.md", diagnosis_prompt
+        )
+        self._update_agent("strategist", AgentPhase.WORKING, f"Diagnosing {target_id}", result.summary[:120])
+        try:
+            diagnosis, diagnosis_result = await runner.run_structured(
+                diagnosis_prompt,
+                SerialCriterionDiagnosis,
+                model=model,
+                agent=config.strategist_agent,
+                title=f"Iteration {iteration}: diagnose {target_id}",
+                status_callback=self._agent_callback("strategist"),
+                cancel_check=self._cancel_check,
+                profile="analysis",
+            )
+            self.store.save_run_artifact(
+                iteration, f"serial-diagnosis-{target_id}-output.txt", diagnosis_result.text
+            )
+        except OpenCodeInterrupted:
+            raise
+        except OpenCodeError as exc:
+            diagnosis = SerialCriterionDiagnosis(
+                summary="No independent diagnosis was available; proceed from the criterion evidence.",
+                root_cause=str(exc),
+            )
+            self.store.save_run_artifact(
+                iteration, f"serial-diagnosis-{target_id}-error.txt", str(exc)
+            )
+
+        self._update_agent("strategist", AgentPhase.COMPLETE, f"Diagnosed {target_id}", diagnosis.summary)
+        self.store.append_event(
+            EventRecord(
+                type="serial_criterion_diagnosed",
+                message=diagnosis.summary,
+                data=diagnosis.model_dump(mode="json"),
+            )
+        )
+        if diagnosis.criteria_revision is not None:
+            admission_error = self._criteria_revision_admission_error(target_def, diagnosis)
+            if admission_error:
+                self.store.append_event(
+                    EventRecord(
+                        type="criteria_revision_rejected",
+                        message=(
+                            "Ignored criteria revision suggestion for "
+                            f"{diagnosis.criteria_revision.criterion_id}: {admission_error}."
+                        ),
+                    )
+                )
+                diagnosis.criteria_revision = None
+        if diagnosis.criteria_revision is not None:
+            current_criteria = self.store.read_criteria()
+            try:
+                _, already_current = apply_criteria_revision(
+                    current_criteria, diagnosis.criteria_revision
+                )
+            except ValueError as exc:
+                self.store.append_event(
+                    EventRecord(
+                        type="criteria_revision_rejected",
+                        message=(
+                            "Ignored invalid criteria revision suggestion for "
+                            f"{diagnosis.criteria_revision.criterion_id}: {exc}"
+                        ),
+                    )
+                )
+                diagnosis.criteria_revision = None
+            if diagnosis.criteria_revision is not None and already_current:
+                self.store.append_event(
+                    EventRecord(
+                        type="criteria_revision_already_current",
+                        message=(
+                            "Ignored already-applied criteria revision suggestion for "
+                            f"{diagnosis.criteria_revision.criterion_id}"
+                        ),
+                    )
+                )
+                diagnosis.criteria_revision = None
+        if diagnosis.criteria_revision is not None:
+            self.state.criteria_revision_suggestions = [
+                item
+                for item in self.state.criteria_revision_suggestions
+                if item.criterion_id != diagnosis.criteria_revision.criterion_id
+            ]
+            self.state.criteria_revision_suggestions.append(diagnosis.criteria_revision)
+            self.store.append_event(
+                EventRecord(
+                    type="criteria_revision_suggested",
+                    message=(
+                        f"Review-required criteria revision suggested for "
+                        f"{diagnosis.criteria_revision.criterion_id}"
+                    ),
+                    data=diagnosis.criteria_revision.model_dump(mode="json"),
+                )
+            )
+            self.store.save_state(self.state)
+            # A suggested criterion revision is a request to change what
+            # success means, not an implementation instruction. Continuing to
+            # run the executor led it to manufacture proxy artifacts (for
+            # example a copied checkpoint) to satisfy stale evidence paths.
+            # Preserve the proposal for review and stop before project code is
+            # changed on the basis of an unapproved measurement change.
+            note = (
+                f"Paused for criteria review: the strategist proposed an update to "
+                f"{diagnosis.criteria_revision.criterion_id}. Review and apply or reject "
+                "the suggestion before resuming implementation."
+            )
+            self.store.update_control(desired_state="paused", note=note)
+            self._reset_agents()
+            self._set_phase(RunPhase.PAUSED, note)
+            self.store.append_event(
+                EventRecord(
+                    type="criteria_revision_review_required",
+                    message=note,
+                    data=diagnosis.criteria_revision.model_dump(mode="json"),
+                )
+            )
+            self.store.save_state(self.state)
+            return
+
         fix_p = criterion_fix_prompt(
             goal=goal,
             criterion=target_def,
             result=result,
             criteria=criteria,
             steering=steering,
+            repair_diagnosis=diagnosis,
+            execution_directive=(
+                (
+                    "This named external benchmark is already in strict implementation recovery. "
+                    "First inspect the official benchmark's documented installation and runner interface, "
+                    "then implement the real model/agent adapter and run it. Do not guess an API or create "
+                    "a fallback, simulated result, fixture, or provenance-only workaround."
+                    if re.search(
+                        r"\b(?:livebench|bfcl|browsecomp|tau[-_ ]?bench)\b",
+                        f"{target_def.id} {target_def.description}",
+                        flags=re.IGNORECASE,
+                    )
+                    else "This target is already in strict implementation recovery. Do not inspect or "
+                    "inventory the workspace; make the first diagnosed source edit immediately."
+                )
+                if self.state.serial_strict_recovery
+                else ""
+            ),
         )
         self.store.save_run_artifact(iteration, f"serial-fix-{target_id}-prompt.md", fix_p)
         self._update_agent("executor", AgentPhase.WORKING, f"Fixing {target_id}", result.summary[:120])
 
         report: ExecutionReport
         try:
-            report, exec_result = await runner.run_structured(
+            exec_result = await runner.run(
                 fix_p,
-                ExecutionReport,
                 model=model,
-                agent=config.executor_agent,
+                # Do not inherit built-in build/plan agent behavior for serial
+                # implementation. The transient agent gets the executor prompt
+                # and permissions from OpenCodeRunner without a read-only plan
+                # mode or the build agent's provider-specific immediate stop.
+                agent=GOAL_AGENT_EXECUTOR_AGENT,
                 title=f"Iteration {iteration}: fix {target_id}",
                 status_callback=self._agent_callback("executor"),
                 cancel_check=self._cancel_check,
-                attempts=2,
-                profile="executor",
+                profile=(
+                    "executor_recovery" if self.state.serial_strict_recovery else "executor"
+                ),
             )
+            report = self._execution_report_from_result(exec_result)
             self.store.save_run_artifact(iteration, f"serial-fix-{target_id}-output.txt", exec_result.text)
         except OpenCodeInterrupted:
             raise
         except OpenCodeError as exc:
+            if self._is_executor_tool_capability_error(exc):
+                note = (
+                    "Auto-paused: the configured OpenCode model/provider returned no executor text "
+                    "or tool call (one-token stop) after fresh retries. Select a tool-capable executor "
+                    "model in Controls, then resume; no project change was attempted."
+                )
+                self.state.last_error = str(exc)
+                self._update_agent("executor", AgentPhase.ERROR, "Executor tool capability unavailable", str(exc))
+                self.store.update_control(desired_state="paused", note=note)
+                self._set_phase(RunPhase.PAUSED, note)
+                self.store.append_event(
+                    EventRecord(
+                        type="executor_tool_capability_unavailable",
+                        message=note,
+                        data={"criterion_id": target_id, "error": str(exc)},
+                    )
+                )
+                self.store.save_state(self.state)
+                return
             report = ExecutionReport(
                 summary=f"Executor error while fixing {target_id}",
                 blockers=[str(exc)],
@@ -312,6 +620,74 @@ class GoalAgentLoop:
             message=report.summary,
             data=report.model_dump(mode="json"),
         ))
+
+        # A diagnosis that identifies a concrete project change must receive an
+        # implementation attempt, not just a directory listing. Give the executor
+        # one tightly constrained retry before spending another evaluation cycle.
+        if (
+            self._report_requires_implementation_retry(report)
+            and (diagnosis.recommended_project_change or diagnosis.executor_plan)
+        ):
+            directive = (
+                "The previous report was a format-repair or reconnaissance response, not proof that "
+                "a file was changed. Implement the diagnosed project "
+                "change now. Your first action must create or edit the directly relevant script or "
+                "evidence artifact; do not inventory directories, search for criteria.yaml, or rerun "
+                "the criterion before making that change. The host shell is Windows PowerShell: "
+                "use PowerShell syntax only (no ||, &&, head, or Unix shell idioms)."
+            )
+            retry_prompt = criterion_fix_prompt(
+                goal=goal,
+                criterion=target_def,
+                result=result,
+                criteria=criteria,
+                steering=steering,
+                repair_diagnosis=diagnosis,
+                execution_directive=directive,
+            )
+            self.store.save_run_artifact(
+                iteration, f"serial-fix-{target_id}-retry-prompt.md", retry_prompt
+            )
+            self._update_agent("executor", AgentPhase.WORKING, f"Retrying {target_id}", directive)
+            try:
+                retry_result = await runner.run(
+                    retry_prompt,
+                    model=model,
+                    agent=GOAL_AGENT_EXECUTOR_AGENT,
+                    title=f"Iteration {iteration}: retry fix {target_id}",
+                    status_callback=self._agent_callback("executor"),
+                    cancel_check=self._cancel_check,
+                    # This is not another reconnaissance turn. Restrict the
+                    # retry to exact reads, edits, and commands so a large log
+                    # listing cannot consume its context before implementation.
+                    profile="executor_recovery",
+                )
+                retry_report = self._execution_report_from_result(retry_result)
+                self.store.save_run_artifact(
+                    iteration, f"serial-fix-{target_id}-retry-output.txt", retry_result.text
+                )
+                report = retry_report
+            except OpenCodeInterrupted:
+                raise
+            except OpenCodeError as exc:
+                self.store.save_run_artifact(
+                    iteration, f"serial-fix-{target_id}-retry-error.txt", str(exc)
+                )
+                self.store.append_event(
+                    EventRecord(
+                        type="serial_fix_retry_error",
+                        message=f"Implementation retry for {target_id} failed: {exc}",
+                    )
+                )
+            else:
+                self._update_agent("executor", AgentPhase.COMPLETE, f"Retry fix for {target_id}", report.summary)
+                self.store.append_event(
+                    EventRecord(
+                        type="serial_fix_retried",
+                        message=report.summary,
+                        data=report.model_dump(mode="json"),
+                    )
+                )
 
         # ── Phase E: re-evaluate the same criterion after the fix ─────
         self._update_agent("evaluator", AgentPhase.WORKING, f"Re-checking {target_id} after fix", "")
@@ -333,6 +709,8 @@ class GoalAgentLoop:
             ))
             self.state.serial_target_criterion = None
             self.state.consecutive_no_progress = 0
+            self.state.serial_consecutive_no_progress = 0
+            self.state.serial_strict_recovery = False
         else:
             self.store.append_event(EventRecord(
                 type="serial_criterion_still_failing",
@@ -340,6 +718,7 @@ class GoalAgentLoop:
                 data=result_after.model_dump(mode="json"),
             ))
             self.state.consecutive_no_progress += 1
+            self.state.serial_consecutive_no_progress += 1
 
         self.store.save_state(self.state)
 
@@ -1061,6 +1440,85 @@ class GoalAgentLoop:
             return True
         return all(self._is_read_only_command(item) for item in commands)
 
+    def _report_requires_implementation_retry(self, report: ExecutionReport) -> bool:
+        """Reject synthetic executor reports that merely converted an empty response.
+
+        OpenCode's JSON format-repair pass has no access to the preceding tool
+        transcript.  It can therefore produce a well-formed ExecutionReport that
+        claims files were changed even when the original turn ended at step_start
+        with no edit or command.  Treat these markers as non-actions rather than
+        trusting their self-reported ``files_changed`` list.
+        """
+
+        if self._report_is_reconnaissance_only(report):
+            return True
+        corpus = " ".join(
+            [report.summary, *report.actions, *report.evidence, *report.blockers]
+        ).lower()
+        synthetic_markers = (
+            "format repair",
+            "step start/finish",
+            "no substantive code changes",
+            "no actionable output",
+            "no file modifications",
+            "stop reason before any code changes",
+        )
+        return any(marker in corpus for marker in synthetic_markers)
+
+    @staticmethod
+    def _execution_report_from_result(result) -> ExecutionReport:
+        """Build a conservative report without requiring JSON from a tool agent.
+
+        Local models can reliably emit OpenAI tool calls yet stop when asked to
+        combine them with a response-schema/JSON final answer.  Executor turns
+        therefore use raw OpenCode responses; tool activity remains enough to
+        decide whether a real implementation attempt occurred.
+        """
+
+        actions: list[str] = []
+        files_changed: list[str] = []
+        commands_run: list[str] = []
+        for event in getattr(result, "events", []) or []:
+            part = event.get("part") if isinstance(event, dict) else None
+            payload = part if isinstance(part, dict) else event if isinstance(event, dict) else {}
+            tool_name = str(
+                payload.get("tool") or payload.get("name") or payload.get("toolName") or ""
+            ).strip()
+            if not tool_name:
+                continue
+            actions.append(f"Observed OpenCode tool: {tool_name}")
+            lowered = tool_name.lower()
+            if any(token in lowered for token in ("edit", "write", "patch", "apply")):
+                files_changed.append(f"(observed {tool_name} tool activity)")
+            elif "bash" in lowered or "shell" in lowered or "command" in lowered:
+                commands_run.append(f"(observed {tool_name} tool activity)")
+
+        text = str(getattr(result, "text", "") or "").strip()
+        if not text and not actions:
+            raise OpenCodeError(
+                "OpenCode completed without a final assistant text response or any tool call."
+            )
+        return ExecutionReport(
+            summary=text[:4000] or "Executor ran tools but did not send a final summary.",
+            actions=actions,
+            files_changed=files_changed,
+            commands_run=commands_run,
+            evidence=[text[-2000:]] if text else [],
+        )
+
+    @staticmethod
+    def _is_executor_tool_capability_error(error: BaseException) -> bool:
+        """Whether OpenCode stopped before an executor could act at all."""
+
+        message = str(error).lower()
+        return (
+            "without a final assistant text response" in message
+            and (
+                "only event records" in message
+                or "without a final assistant text response or any tool call" in message
+            )
+        )
+
     def _is_read_only_command(self, command: str) -> bool:
         lowered = command.strip().lower()
         read_only_prefixes = (
@@ -1096,7 +1554,34 @@ class GoalAgentLoop:
         agent.task = task
         agent.detail = detail[-1000:]
         agent.updated_at = utc_now()
+        self._record_agent_activity(name, "status", f"{task}: {detail}".strip(": "))
         self._save_state_throttled(force=phase != AgentPhase.WORKING)
+
+    def _record_agent_activity(self, name: str, event_type: str, detail: str) -> None:
+        """Keep a compact user-visible record of agent messages and tool progress."""
+
+        rendered = str(detail or "").strip()[-1200:]
+        if not rendered:
+            return
+        recent = self.state.agent_activity[-1] if self.state.agent_activity else None
+        if (
+            recent
+            and recent.agent == name
+            and recent.iteration == self.state.iteration
+            and recent.event_type == event_type
+            and recent.detail == rendered
+        ):
+            return
+        self.state.agent_activity.append(
+            AgentActivity(
+                agent=name,
+                iteration=self.state.iteration,
+                event_type=event_type,
+                detail=rendered,
+            )
+        )
+        if len(self.state.agent_activity) > 500:
+            self.state.agent_activity = self.state.agent_activity[-500:]
 
     def _agent_callback(self, name: str):
         def callback(event_type: str, detail: str) -> None:
@@ -1118,6 +1603,7 @@ class GoalAgentLoop:
                 agent.phase = AgentPhase.WORKING
             agent.detail = detail[-1000:]
             agent.updated_at = utc_now()
+            self._record_agent_activity(name, event_type, detail)
             self._save_state_throttled(force=event_type in {"context_recovery", "error"})
 
         return callback

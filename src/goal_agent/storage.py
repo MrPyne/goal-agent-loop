@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,8 @@ from .models import (
 AGENT_DIR_NAME = ".goal-agent"
 DEFAULT_GOAL_ID = "default"
 _GOAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_ATOMIC_REPLACE_ATTEMPTS = 8
+_ATOMIC_REPLACE_RETRY_SECONDS = 0.05
 
 
 class ProjectStore:
@@ -505,6 +508,31 @@ class ProjectStore:
                     lines.extend(f"- {action}" for action in item.recommended_actions)
                     lines.append("")
 
+        lines.extend(["", "## Criteria Revision Suggestions", ""])
+        if not state.criteria_revision_suggestions:
+            lines.append("_No review-required criteria revisions have been suggested._")
+        else:
+            lines.append("These are advisory only; review and apply them through criteria refinement.")
+            lines.append("")
+            for suggestion in state.criteria_revision_suggestions[-5:][::-1]:
+                lines.extend(
+                    [
+                        f"### `{suggestion.criterion_id}` â€” approval required",
+                        "",
+                        suggestion.rationale,
+                        "",
+                    ]
+                )
+                if suggestion.safeguards:
+                    lines.append("Safeguards:")
+                    lines.extend(f"- {item}" for item in suggestion.safeguards)
+                    lines.append("")
+                if suggestion.proposed_criteria:
+                    lines.append("Proposed replacement criteria:")
+                    for item in suggestion.proposed_criteria:
+                        lines.append(f"- `{item.id}`: {item.description}")
+                    lines.append("")
+
         lines.extend(["", "## Recent Hypotheses", ""])
         if not state.hypotheses:
             lines.append("_No hypotheses have been proposed yet._")
@@ -599,7 +627,18 @@ class ProjectStore:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_name, path)
+            # Windows can transiently reject a rename when an antivirus scan,
+            # browser file watcher, or another short-lived reader still holds
+            # the destination. The state lock serializes Goal Agent writers,
+            # but cannot control those external handles.
+            for attempt in range(_ATOMIC_REPLACE_ATTEMPTS):
+                try:
+                    os.replace(temp_name, path)
+                    break
+                except PermissionError:
+                    if attempt == _ATOMIC_REPLACE_ATTEMPTS - 1:
+                        raise
+                    time.sleep(_ATOMIC_REPLACE_RETRY_SECONDS * (attempt + 1))
         finally:
             if os.path.exists(temp_name):
                 os.unlink(temp_name)

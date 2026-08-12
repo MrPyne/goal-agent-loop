@@ -1,7 +1,15 @@
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from goal_agent.models import (
+    CriteriaDocument,
+    CriteriaRevisionSuggestion,
+    CriterionDefinition,
+    CriterionKind,
+    apply_criteria_revision,
+)
 from goal_agent.storage import ProjectStore
 from goal_agent.web import create_app
 
@@ -197,10 +205,205 @@ def test_live_polling_preserves_focused_steering_input() -> None:
     html = (assets / "index.html").read_text(encoding="utf-8")
 
     assert "function captureSteeringDraft()" in script
+    assert "function detailStructureSignature(detail)" in script
+    assert "function updateLiveDetail()" in script
+    assert "function captureExpandedDetails()" in script
+    assert "function restoreExpandedDetails(snapshot)" in script
     assert "function isUserEditingMainContent()" in script
     assert "state.pendingDetailRender = true" in script
     assert "state.steeringDrafts[state.selectedId] = event.target.value" in script
     assert '${esc(steeringDraft())}</textarea>' in script
     assert 'Date.now() < state.interactionHoldUntil' in script
     assert 'const detail = await api(`/api/goals/${encodeURIComponent(state.selectedId)}`);\n      applyPolledDetail(detail);' in script
-    assert "/app.js?v=0.7.1" in html
+    assert "function renderCriteriaRevisionSuggestions(suggestions)" in script
+    assert "Criteria review required" in script
+    assert "data-apply-criteria-revision" in script
+    assert "data-dismiss-criteria-revision" in script
+    assert "/criteria-revisions/${encodeURIComponent(criterionId)}/dismiss" in script
+    assert "/app.js?v=0.7.7" in html
+
+
+def test_split_criteria_revision_replaces_the_broad_original_and_deduplicates() -> None:
+    current = CriteriaDocument(
+        criteria=[
+            CriterionDefinition(
+                id="broad",
+                description="The complete system works",
+                kind=CriterionKind.AI_JUDGE,
+                judge_prompt="PASS only if the complete system works; FAIL otherwise.",
+            ),
+            CriterionDefinition(
+                id="preserve",
+                description="Regression command passes",
+                kind=CriterionKind.COMMAND,
+                command="python -m pytest",
+            ),
+        ]
+    )
+    suggestion = CriteriaRevisionSuggestion(
+        criterion_id="broad",
+        rationale="Split the broad claim into independently checkable requirements.",
+        proposed_criteria=[
+            CriterionDefinition(
+                id="artifact-exists",
+                description="The required artifact exists",
+                kind=CriterionKind.FILE_EXISTS,
+                path="artifact.txt",
+            ),
+            CriterionDefinition(
+                id="artifact-valid",
+                description="The required artifact validates",
+                kind=CriterionKind.COMMAND,
+                command="python scripts/validate_artifact.py",
+            ),
+        ],
+    )
+
+    revised, already_current = apply_criteria_revision(current, suggestion)
+
+    assert not already_current
+    assert [item.id for item in revised.criteria] == [
+        "artifact-exists",
+        "artifact-valid",
+        "preserve",
+    ]
+    assert "broad" not in {item.id for item in revised.criteria}
+    unchanged, already_current = apply_criteria_revision(revised, suggestion)
+    assert already_current
+    assert unchanged == revised
+
+
+def test_criteria_revision_can_remove_a_redundant_target() -> None:
+    current = CriteriaDocument(
+        criteria=[
+            CriterionDefinition(
+                id="strong-live-check",
+                description="A direct live inference check passes",
+                kind=CriterionKind.COMMAND,
+                command="python scripts/quality_gate.py --tool-use-gate",
+            ),
+            CriterionDefinition(
+                id="duplicate-replay-check",
+                description="A replay log claims the same tool-use behavior",
+                kind=CriterionKind.AI_JUDGE,
+                judge_prompt="PASS only if the replay log claims tool use.",
+            ),
+        ]
+    )
+    suggestion = CriteriaRevisionSuggestion(
+        criterion_id="duplicate-replay-check",
+        rationale="The direct live check already verifies this behavior.",
+        remove_target=True,
+    )
+
+    revised, already_current = apply_criteria_revision(current, suggestion)
+
+    assert not already_current
+    assert [item.id for item in revised.criteria] == ["strong-live-check"]
+    unchanged, already_current = apply_criteria_revision(revised, suggestion)
+    assert already_current
+    assert unchanged == revised
+
+
+def test_strategist_cannot_revise_named_external_benchmark() -> None:
+    current = CriteriaDocument(
+        criteria=[
+            CriterionDefinition(
+                id="tau_bench_score",
+                description="The model scores at least 70% on tau-bench.",
+                kind=CriterionKind.COMMAND,
+                command="python scripts/run_taubench.py",
+            )
+        ]
+    )
+    suggestion = CriteriaRevisionSuggestion(
+        criterion_id="tau_bench_score",
+        rationale="Use a friendlier JSON extraction check.",
+        revision_reason="unachievable",
+        proposed_criteria=[
+            CriterionDefinition(
+                id="tau_bench_score",
+                description="Extract a score from a text file.",
+                kind=CriterionKind.AI_JUDGE,
+                judge_prompt="Extract the score.",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="cannot revise named external benchmark"):
+        apply_criteria_revision(current, suggestion)
+
+
+def test_command_revision_with_only_evidence_paths_is_already_current() -> None:
+    current = CriteriaDocument(
+        criteria=[
+            CriterionDefinition(
+                id="livebench",
+                description="LiveBench score meets the target",
+                kind=CriterionKind.COMMAND,
+                command="python scripts/run_livebench.py",
+                expected_exit_code=0,
+            )
+        ]
+    )
+    suggestion = CriteriaRevisionSuggestion(
+        criterion_id="livebench",
+        rationale="This only documents where the command writes results.",
+        proposed_criteria=[
+            CriterionDefinition(
+                id="livebench",
+                description="LiveBench score meets the target",
+                kind=CriterionKind.COMMAND,
+                command="python scripts/run_livebench.py",
+                expected_exit_code=0,
+                evidence_paths=["logs/livebench_results.json"],
+            )
+        ],
+    )
+
+    revised, already_current = apply_criteria_revision(current, suggestion)
+
+    assert already_current
+    assert [item.id for item in revised.criteria] == ["livebench"]
+
+
+def test_web_can_dismiss_a_pending_criteria_revision(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("GOAL_AGENT_REGISTRY_PATH", str(tmp_path / "registry.json"))
+    store = ProjectStore(tmp_path)
+    store.initialize(model="fake/model")
+    current = CriteriaDocument(
+        criteria=[
+            CriterionDefinition(
+                id="keep",
+                description="keep.txt exists",
+                kind=CriterionKind.FILE_EXISTS,
+                path="keep.txt",
+            )
+        ]
+    )
+    store.write_criteria(current)
+    state = store.load_state()
+    state.criteria_revision_suggestions = [
+        CriteriaRevisionSuggestion(
+            criterion_id="keep",
+            rationale="A user may decide this advisory proposal is not useful.",
+            proposed_criteria=[
+                CriterionDefinition(
+                    id="keep-replacement",
+                    description="replacement.txt exists",
+                    kind=CriterionKind.FILE_EXISTS,
+                    path="replacement.txt",
+                )
+            ],
+        )
+    ]
+    store.save_state(state)
+
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.post("/api/goals/default/criteria-revisions/keep/dismiss")
+
+    assert response.status_code == 200
+    assert response.json()["state"]["criteria_revision_suggestions"] == []
+    assert [item.id for item in store.read_criteria().criteria] == ["keep"]

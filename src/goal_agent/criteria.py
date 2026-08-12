@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import hashlib
+import json
 import os
 import re
 import time
@@ -47,6 +49,23 @@ _TEXT_SUFFIXES = {
     ".cs", ".go", ".rs", ".sh", ".ps1", ".bat", ".cmd", ".xml", ".sql",
     ".log",
 }
+_EXTERNAL_BENCHMARKS: dict[str, tuple[tuple[str, ...], str, str]] = {
+    "livebench": (("livebench",), "logs/livebench_results.json", "github.com/livebench/livebench"),
+    "bfcl": (("bfcl",), "logs/bfcl_results.json", "gorilla.cs.berkeley.edu"),
+    "browsecomp": (("browsecomp",), "logs/browscomp_results.json", "github.com/openai/simple-evals"),
+    "tau_bench": (("tau_bench", "tau-bench", "taubench"), "logs/taubench_results.json", "github.com/sierra-research/tau2-bench"),
+}
+_NON_OFFICIAL_RUNNER_MARKERS = (
+    "fallback",
+    "placeholder",
+    "rule-based",
+    "random()",
+    "generated score",
+    "inline subset",
+    "project-defined sample",
+    "simulated_results",
+    "simulate tau-bench",
+)
 
 
 class EvaluationInterrupted(RuntimeError):
@@ -260,6 +279,11 @@ class CriteriaEvaluator:
                 case_sensitive=criterion.output_case_sensitive,
             )
 
+        benchmark_integrity_error = self._external_benchmark_integrity_error(criterion)
+        if benchmark_integrity_error:
+            passed = False
+            checks.append("benchmark provenance rejected: " + benchmark_integrity_error)
+
         ai_judge_summary: str | None = None
         ai_judge_evidence: list[str] = []
         ai_judge_confidence: float | None = None
@@ -293,6 +317,8 @@ class CriteriaEvaluator:
 
         if ai_judge_summary:
             summary = ai_judge_summary
+        elif benchmark_integrity_error:
+            summary = "External benchmark evidence rejected: " + benchmark_integrity_error
         elif checks:
             summary = (
                 "Command output satisfied all configured checks"
@@ -314,6 +340,73 @@ class CriteriaEvaluator:
             evidence=evidence,
             confidence=ai_judge_confidence,
         )
+
+    def _external_benchmark_integrity_error(self, criterion: CriterionDefinition) -> str | None:
+        """Fail closed for named external benchmark criteria.
+
+        Project-side agents may legitimately build or change a runner, but an exit
+        code alone is not evidence that it exercised the named public benchmark.
+        These checks live outside the target project, so a runner cannot make a
+        generated or fallback value promotable by setting ``score_valid`` itself.
+        """
+
+        text = " ".join(
+            value for value in (criterion.id, criterion.description, criterion.command) if value
+        ).lower()
+        benchmark = next(
+            (
+                details
+                for aliases, *details in _EXTERNAL_BENCHMARKS.values()
+                if any(alias in text for alias in aliases)
+            ),
+            None,
+        )
+        if benchmark is None:
+            return None
+
+        result_path_text, official_source = benchmark
+        result_path = self.config.project_path / result_path_text
+        if not result_path.is_file():
+            return f"missing result artifact {result_path_text}"
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"cannot read {result_path_text}: {exc}"
+        if result.get("score_valid") is not True:
+            return f"{result_path_text} does not declare score_valid=true"
+
+        provenance = result.get("provenance")
+        if not isinstance(provenance, dict):
+            return f"{result_path_text} has no official-run provenance record"
+        source = str(provenance.get("official_source", ""))
+        if official_source not in source:
+            return f"official_source must identify {official_source}"
+        if not str(provenance.get("dataset_revision", "")).strip():
+            return "provenance is missing dataset_revision"
+        raw_path_text = provenance.get("raw_results_path")
+        raw_sha256 = str(provenance.get("raw_results_sha256", ""))
+        if not isinstance(raw_path_text, str) or not raw_sha256:
+            return "provenance is missing raw_results_path or raw_results_sha256"
+        raw_path = (self.config.project_path / raw_path_text).resolve()
+        try:
+            raw_path.relative_to(self.config.project_path.resolve())
+        except ValueError:
+            return "raw_results_path escapes the project directory"
+        if not raw_path.is_file():
+            return f"raw benchmark artifact is missing: {raw_path_text}"
+        actual_sha256 = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+        if actual_sha256.lower() != raw_sha256.lower():
+            return "raw benchmark artifact hash does not match provenance"
+
+        script_match = re.search(r"(?:^|\\s)(scripts[\\/][^\\s]+\\.py)", criterion.command or "")
+        if script_match:
+            runner_path = self.config.project_path / script_match.group(1).replace("/", os.sep).replace("\\", os.sep)
+            if runner_path.is_file():
+                runner_source = runner_path.read_text(encoding="utf-8", errors="replace").lower()
+                marker = next((item for item in _NON_OFFICIAL_RUNNER_MARKERS if item in runner_source), None)
+                if marker:
+                    return f"runner contains non-official path marker '{marker}'"
+        return None
 
     async def _judge_command_output(
         self,

@@ -67,6 +67,29 @@ def test_proposal_quality_accepts_concrete_command_criterion() -> None:
     assert not [item for item in checked.criteria_quality_issues if item.severity == "blocking"]
 
 
+def test_proposal_quality_blocks_metric_threshold_with_exit_code_only() -> None:
+    proposal = SetupProposal(
+        goal="Reach the target benchmark score",
+        criteria=[
+            CriterionDefinition(
+                id="benchmark-score",
+                description="The model scores at least 70% on the benchmark.",
+                kind=CriterionKind.COMMAND,
+                command="python run_benchmark.py",
+            )
+        ],
+    )
+
+    checked = assess_setup_proposal(proposal)
+
+    assert any(
+        item.criterion_id == "benchmark-score"
+        and "numeric score threshold" in item.issue
+        and item.severity == "blocking"
+        for item in checked.criteria_quality_issues
+    )
+
+
 def test_proposal_quality_blocks_required_file_exists_only_gate() -> None:
     proposal = SetupProposal(
         refined_goal="Deliver a reliable reporting pipeline",

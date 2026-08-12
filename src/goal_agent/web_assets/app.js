@@ -21,6 +21,7 @@ const state = {
   agentChat: { goalId: null, agentName: null, autoRefresh: false, refreshTimer: null, runs: [] },
   steeringDrafts: {},
   lastDetailSignature: null,
+  lastDetailStructureSignature: null,
   interactionHoldUntil: 0,
 };
 
@@ -91,12 +92,53 @@ function detailSignature(detail) {
   });
 }
 
+// Agent activity, messages, timestamps, and events change frequently while a
+// loop is working.  They are updated in place below; they must not rebuild the
+// entire tab (which closes <details> elements the user is reading).
+function detailStructureSignature(detail) {
+  if (!detail) return "";
+  return JSON.stringify({
+    metadata: detail.metadata,
+    goal: detail.goal,
+    criteria: detail.criteria,
+    control: {
+      desired_state: detail.control?.desired_state,
+      model_override: detail.control?.model_override,
+    },
+    phase: detail.state?.phase,
+    criteria_results: detail.state?.criteria_results,
+    hypotheses: detail.state?.hypotheses,
+    active_hypothesis_id: detail.state?.active_hypothesis_id,
+    serial_target_criterion: detail.state?.serial_target_criterion,
+    evaluation_analysis: detail.state?.evaluation_analysis,
+    criteria_revision_suggestions: detail.state?.criteria_revision_suggestions,
+  });
+}
+
+function captureExpandedDetails() {
+  return $$("#main-content details").map((node, index) => ({
+    key: node.dataset.expansionKey || String(index),
+    open: node.open,
+  }));
+}
+
+function restoreExpandedDetails(snapshot) {
+  if (!snapshot?.length) return;
+  const byKey = new Map(snapshot.map(item => [item.key, item.open]));
+  $$("#main-content details").forEach((node, index) => {
+    const key = node.dataset.expansionKey || String(index);
+    if (byKey.has(key)) node.open = byKey.get(key);
+  });
+}
+
 function applyPolledDetail(detail) {
   const signature = detailSignature(detail);
-  const changed = signature !== state.lastDetailSignature;
+  const structureSignature = detailStructureSignature(detail);
+  const structureChanged = structureSignature !== state.lastDetailStructureSignature;
   state.detail = detail;
-  if (!changed) {
-    updateHeaderStatusOnly();
+  if (!structureChanged) {
+    state.lastDetailSignature = signature;
+    updateLiveDetail();
     return;
   }
   if (isUserEditingMainContent()) {
@@ -107,6 +149,7 @@ function applyPolledDetail(detail) {
   }
   state.pendingDetailRender = false;
   state.lastDetailSignature = signature;
+  state.lastDetailStructureSignature = structureSignature;
   renderDetail();
 }
 
@@ -255,6 +298,7 @@ async function selectGoal(goalId) {
   state.pendingDetailRender = false;
   state.detail = await api(`/api/goals/${encodeURIComponent(goalId)}`);
   state.lastDetailSignature = detailSignature(state.detail);
+  state.lastDetailStructureSignature = detailStructureSignature(state.detail);
   renderGoalList();
   renderDetail();
 }
@@ -271,6 +315,7 @@ function updateHeaderStatusOnly() {
 
 function renderDetail() {
   if (!state.detail) return;
+  const expandedDetails = captureExpandedDetails();
   captureSteeringDraft();
   const d = state.detail;
   const phase = d.state.phase;
@@ -281,7 +326,7 @@ function renderDetail() {
       <div>
         <span class="eyebrow">${esc(d.metadata.id)}</span>
         <div class="detail-title-row"><h2>${esc(d.metadata.title)}</h2><span id="detail-phase" class="badge ${esc(phase)}">${esc(phase)}</span></div>
-        <p class="detail-subtitle">Iteration ${d.state.iteration} · ${esc(d.state.message)}</p>
+        <p id="detail-subtitle" class="detail-subtitle">Iteration ${d.state.iteration} · ${esc(d.state.message)}</p>
       </div>
       <div class="goal-actions">
         <div class="model-control">
@@ -301,6 +346,63 @@ function renderDetail() {
     </nav>
     <div id="tab-content">${renderActiveTab()}</div>
   </div>`;
+  restoreExpandedDetails(expandedDetails);
+  state.lastDetailSignature = detailSignature(state.detail);
+  state.lastDetailStructureSignature = detailStructureSignature(state.detail);
+}
+
+function renderLiveStatusProgress(evaluatorAgent) {
+  return evaluatorAgent ? `<div class="live-status-progress"><strong>Current evaluation step</strong><p>${esc(evaluatorAgent.task || "Evaluating criteria")}</p><small>${esc(evaluatorAgent.detail || "Checking the next success criterion…")}</small></div>` : "";
+}
+
+function renderLiveStatusAgent(liveAgent) {
+  return liveAgent ? `<div class="live-status-agent"><span class="eyebrow">Active agent</span><strong>${esc(liveAgent.name)}</strong><span class="badge ${esc(liveAgent.phase)}">${esc(liveAgent.phase)}</span><div>${esc(liveAgent.task || "Idle")}</div><p>${esc(liveAgent.detail || "No detailed progress yet.")}</p></div>` : "";
+}
+
+function renderAgentCards(agents) {
+  return agents.map(([name, agent]) => `<article class="card agent-card">
+    <div class="agent-top"><span class="agent-name">${esc(name)}</span><span class="badge ${esc(agent.phase)}">${esc(agent.phase)}</span></div>
+    <div class="agent-task">${esc(agent.task)}</div>
+    <div class="agent-detail">${esc(agent.detail || "No current detail")}</div>
+    <button class="button ghost agent-chat-btn" data-agent="${esc(name)}" style="margin-top:8px;font-size:0.78em">View activity →</button>
+  </article>`).join("");
+}
+
+function updateLiveDetail() {
+  const d = state.detail;
+  if (!d || state.activeTab !== "overview") {
+    updateHeaderStatusOnly();
+    return;
+  }
+  const definitions = d.criteria.criteria;
+  const results = d.state.criteria_results || {};
+  const required = definitions.filter(c => c.required);
+  const passed = required.filter(c => results[c.id]?.passed).length;
+  const agents = Object.entries(d.state.agents || {});
+  const liveAgent = selectLiveAgent(d.state.agents || {});
+  const evaluatorAgent = d.state.agents?.evaluator || null;
+  const setText = (selector, value) => { const node = $(selector); if (node) node.textContent = value; };
+  setText("#detail-subtitle", `Iteration ${d.state.iteration} · ${d.state.message || ""}`);
+  updateHeaderStatusOnly();
+  const liveCard = $(".live-status-card");
+  if (liveCard) liveCard.classList.toggle("live", d.control.desired_state === "running");
+  const livePhase = $("#live-phase");
+  if (livePhase) { livePhase.className = `badge ${d.state.phase}`; livePhase.textContent = d.state.phase; }
+  setText("#live-status-message", d.state.message || "No current status");
+  setText("#live-desired-state", d.control.desired_state);
+  setText("#live-iteration", String(d.state.iteration));
+  setText("#live-updated-at", fmtTime(d.state.updated_at));
+  setText("#live-last-error", d.state.last_error || "None");
+  setText("#live-criteria-checked", `${Object.values(results).filter(result => result && result.status && result.status !== "unchecked").length}/${definitions.length}`);
+  setText("#live-required-passing", `${passed}/${required.length}`);
+  const progress = $("#live-status-progress");
+  if (progress) progress.innerHTML = renderLiveStatusProgress(evaluatorAgent);
+  const agent = $("#live-status-agent");
+  if (agent) agent.innerHTML = renderLiveStatusAgent(liveAgent);
+  const cards = $("#agent-cards");
+  if (cards) cards.innerHTML = renderAgentCards(agents);
+  const events = $("#recent-event-list");
+  if (events) events.innerHTML = renderEventList((d.events || []).slice(-6).reverse());
 }
 
 function buildModelOptions(d) {
@@ -339,32 +441,26 @@ function renderOverview() {
   return `<div class="grid two">
     <div class="grid">
       <section class="card live-status-card ${d.control.desired_state === "running" ? "live" : ""}">
-        <div class="card-heading"><h3>Loop status</h3><span class="badge ${esc(d.state.phase)}">${esc(d.state.phase)}</span></div>
-        <div class="live-status-message">${esc(d.state.message || "No current status")}</div>
+        <div class="card-heading"><h3>Loop status</h3><span id="live-phase" class="badge ${esc(d.state.phase)}">${esc(d.state.phase)}</span></div>
+        <div id="live-status-message" class="live-status-message">${esc(d.state.message || "No current status")}</div>
         <div class="live-status-grid">
-          <div><span class="eyebrow">Desired state</span><div>${esc(d.control.desired_state)}</div></div>
-          <div><span class="eyebrow">Iteration</span><div>${esc(String(d.state.iteration))}</div></div>
-          <div><span class="eyebrow">Last update</span><div>${esc(fmtTime(d.state.updated_at))}</div></div>
-          <div><span class="eyebrow">Last error</span><div>${esc(d.state.last_error || "None")}</div></div>
-          <div><span class="eyebrow">Criteria checked</span><div>${esc(`${checked}/${totalCriteria}`)}</div></div>
-          <div><span class="eyebrow">Required passing</span><div>${esc(`${passed}/${required.length}`)}</div></div>
+          <div><span class="eyebrow">Desired state</span><div id="live-desired-state">${esc(d.control.desired_state)}</div></div>
+          <div><span class="eyebrow">Iteration</span><div id="live-iteration">${esc(String(d.state.iteration))}</div></div>
+          <div><span class="eyebrow">Last update</span><div id="live-updated-at">${esc(fmtTime(d.state.updated_at))}</div></div>
+          <div><span class="eyebrow">Last error</span><div id="live-last-error">${esc(d.state.last_error || "None")}</div></div>
+          <div><span class="eyebrow">Criteria checked</span><div id="live-criteria-checked">${esc(`${checked}/${totalCriteria}`)}</div></div>
+          <div><span class="eyebrow">Required passing</span><div id="live-required-passing">${esc(`${passed}/${required.length}`)}</div></div>
         </div>
-        ${evaluatorAgent ? `<div class="live-status-progress"><strong>Current evaluation step</strong><p>${esc(evaluatorAgent.task || "Evaluating criteria")}</p><small>${esc(evaluatorAgent.detail || "Checking the next success criterion…")}</small></div>` : ""}
-        ${liveAgent ? `<div class="live-status-agent"><span class="eyebrow">Active agent</span><strong>${esc(liveAgent.name)}</strong><span class="badge ${esc(liveAgent.phase)}">${esc(liveAgent.phase)}</span><div>${esc(liveAgent.task || "Idle")}</div><p>${esc(liveAgent.detail || "No detailed progress yet.")}</p></div>` : ""}
+        <div id="live-status-progress">${renderLiveStatusProgress(evaluatorAgent)}</div>
+        <div id="live-status-agent">${renderLiveStatusAgent(liveAgent)}</div>
         ${d.state.phase === "running" ? `<p class="live-status-note">The loop is active. If the task looks unchanged, the current step may be evaluating criteria, waiting on OpenCode, or preparing the next hypothesis.</p>` : ""}
       </section>
       <section class="card">
         <div class="card-heading"><h3>Goal</h3><button class="button ghost" data-tab="definition">Edit definition</button></div>
         <div class="goal-copy">${esc(d.goal)}</div>
       </section>
-      <section class="grid three">
-        ${agents.map(([name, agent]) => `<article class="card agent-card">
-          <div class="agent-top"><span class="agent-name">${esc(name)}</span><span class="badge ${esc(agent.phase)}">${esc(agent.phase)}</span></div>
-          <div class="agent-task">${esc(agent.task)}</div>
-          <div class="agent-detail">${esc(agent.detail || "No current detail")}</div>
-          <button class="button ghost agent-chat-btn" data-agent="${esc(name)}" style="margin-top:8px;font-size:0.78em">View chat \u2192</button>
-        </article>`).join("")}
-      </section>
+      ${renderCriteriaRevisionSuggestions(d.state.criteria_revision_suggestions || [])}
+      <section id="agent-cards" class="grid three">${renderAgentCards(agents)}</section>
       <section class="card">
         <div class="card-heading"><h3>Success criteria</h3><span class="muted small">${passed} of ${required.length} required passing</span></div>
         <div class="progress-row"><div class="big-progress"><span style="width:${pct(passed, required.length)}%"></span></div><strong>${pct(passed, required.length)}%</strong></div>
@@ -394,10 +490,30 @@ function renderOverview() {
       </section>
       <section class="card">
         <div class="card-heading"><h3>Recent activity</h3><button class="button ghost" data-tab="history">View all</button></div>
-        ${renderEventList((d.events || []).slice(-6).reverse())}
+        <div id="recent-event-list">${renderEventList((d.events || []).slice(-6).reverse())}</div>
       </section>
     </div>
   </div>`;
+}
+
+function renderCriteriaRevisionSuggestions(suggestions) {
+  if (!suggestions.length) return "";
+  return `<section class="card criteria-revision-card">
+    <div class="card-heading"><h3>Criteria review required</h3><span class="badge blocked">${suggestions.length} pending</span></div>
+    <p class="criteria-revision-intro">The strategist found that a criterion may be measuring the wrong evidence. These suggestions are not applied automatically.</p>
+    <div class="criteria-revision-list">${suggestions.slice(-3).reverse().map(suggestion => `
+      <article class="criteria-revision-item">
+        <div><strong>${esc(suggestion.criterion_id)}</strong><span class="eyebrow"> approval required</span></div>
+        <p>${esc(suggestion.rationale || "No rationale was recorded.")}</p>
+        ${suggestion.remove_target ? `<p class="criteria-revision-removal"><strong>Proposed action:</strong> remove this redundant criterion; no replacement is added.</p>` : ""}
+        ${suggestion.proposed_criteria?.length ? `<details><summary>Proposed replacement (${suggestion.proposed_criteria.length})</summary><ul>${suggestion.proposed_criteria.map(criterion => `<li><strong>${esc(criterion.id)}</strong> — ${esc(criterion.description)}</li>`).join("")}</ul></details>` : ""}
+        ${suggestion.safeguards?.length ? `<details><summary>Safeguards</summary><ul>${suggestion.safeguards.map(item => `<li>${esc(item)}</li>`).join("")}</ul></details>` : ""}
+        <div class="criteria-revision-actions">
+          <button class="button primary compact" data-apply-criteria-revision="${esc(suggestion.criterion_id)}">${suggestion.remove_target ? "Remove and restart" : "Apply and restart"}</button>
+          <button class="button ghost compact" data-dismiss-criteria-revision="${esc(suggestion.criterion_id)}">Ignore suggestion</button>
+        </div>
+      </article>`).join("")}</div>
+  </section>`;
 }
 
 function selectLiveAgent(agents) {
@@ -689,6 +805,10 @@ function bindGlobalEvents() {
     if (bulk) return runBulkAction(bulk.dataset.bulk);
     if (event.target.closest("[data-load-models]")) return loadModels();
     if (event.target.closest("[data-add-steering]")) return addSteering();
+    const criteriaRevision = event.target.closest("[data-apply-criteria-revision]");
+    if (criteriaRevision) return applyCriteriaRevision(criteriaRevision.dataset.applyCriteriaRevision);
+    const dismissCriteriaRevision = event.target.closest("[data-dismiss-criteria-revision]");
+    if (dismissCriteriaRevision) return dismissCriteriaRevisionSuggestion(dismissCriteriaRevision.dataset.dismissCriteriaRevision);
     if (event.target.closest("[data-save-definition]")) return saveDefinition();
     if (event.target.closest("[data-setup-complete]")) return completeSetup();
     if (event.target.closest("[data-add-criterion]")) return addCriterion();
@@ -877,6 +997,39 @@ async function runAction(action) {
   try {
     await api(`/api/goals/${encodeURIComponent(state.selectedId)}/action`, { method: "POST", body: JSON.stringify({ action }) });
     toast(`${action} requested`); await poll();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function applyCriteriaRevision(criterionId) {
+  const approved = window.confirm(
+    `Apply the proposed revision for ${criterionId} and restart this goal? This changes the saved success criteria.`
+  );
+  if (!approved) return;
+  try {
+    state.detail = await api(
+      `/api/goals/${encodeURIComponent(state.selectedId)}/criteria-revisions/${encodeURIComponent(criterionId)}/apply`,
+      { method: "POST" },
+    );
+    state.editorDirty = false;
+    await refreshGoals();
+    renderDetail();
+    toast(`Applied ${criterionId} revision and restarted the goal`);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function dismissCriteriaRevisionSuggestion(criterionId) {
+  const confirmed = window.confirm(
+    `Ignore the suggested revision for ${criterionId}? This keeps the current criteria unchanged and does not restart the loop.`
+  );
+  if (!confirmed) return;
+  try {
+    state.detail = await api(
+      `/api/goals/${encodeURIComponent(state.selectedId)}/criteria-revisions/${encodeURIComponent(criterionId)}/dismiss`,
+      { method: "POST" },
+    );
+    await refreshGoals();
+    renderDetail();
+    toast(`Ignored ${criterionId} suggestion. Resume the goal when ready.`);
   } catch (error) { toast(error.message, "error"); }
 }
 
@@ -1353,9 +1506,9 @@ boot().catch(error => toast(error.message, "error"));
 // ─── Agent Chat Modal ─────────────────────────────────────────────────────────
 
 const AGENT_FILE_HINTS = {
-  strategist: ["strategist-prompt.md", "strategist-output.txt"],
+  strategist: ["strategist-prompt.md", "strategist-output.txt", "serial-diagnosis-"],
   executor:   ["executor-prompt.md", "executor-output.txt", "serial-fix-", "executor-verify-output.txt", "executor-retry-output.txt"],
-  evaluator:  ["baseline-analysis-prompt.md", "baseline-analysis-output.txt", "post-execution-analysis-output.txt"],
+  evaluator:  ["baseline-analysis-prompt.md", "baseline-analysis-output.txt", "post-execution-analysis-output.txt", "serial-final-"],
 };
 
 function agentFileScore(name, agentName) {
@@ -1376,7 +1529,7 @@ async function openAgentChat(agentName) {
   const modal = $("#agent-chat-modal");
   modal.classList.remove("hidden");
   $("#agent-chat-eyebrow").textContent = agentName.charAt(0).toUpperCase() + agentName.slice(1) + " agent";
-  $("#agent-chat-title").textContent = "Chat history";
+  $("#agent-chat-title").textContent = "Agent activity";
   const subtitle = d.state?.agents?.[agentName];
   $("#agent-chat-subtitle").textContent = subtitle ? `${subtitle.phase} — ${subtitle.task || "Idle"}` : "";
 
@@ -1409,9 +1562,10 @@ async function loadAgentChatFiles() {
 
   const run = runs.find(r => r.iteration === iteration);
   const files = run ? run.files : [];
+  const relevant = files.filter(file => agentFileScore(file, agentName) >= 0);
 
-  // Sort: agent-relevant files first, then everything else alphabetically
-  const sorted = [...files].sort((a, b) => {
+  // Do not mix other agents' artifacts into this agent's view.
+  const sorted = [...relevant].sort((a, b) => {
     const sa = agentFileScore(a, agentName), sb = agentFileScore(b, agentName);
     if (sa !== sb) return sb - sa;
     return a.localeCompare(b);
@@ -1419,13 +1573,27 @@ async function loadAgentChatFiles() {
 
   const fileSel = $("#agent-chat-file-select");
   const prevFile = fileSel.value;
-  fileSel.innerHTML = sorted.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join("");
+  fileSel.innerHTML = sorted.length
+    ? sorted.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join("")
+    : `<option value="">No saved artifact for this agent</option>`;
   // Auto-select best match for this agent
   const best = sorted.find(f => agentFileScore(f, agentName) >= 0) || sorted[0];
   if (prevFile && sorted.includes(prevFile)) fileSel.value = prevFile;
   else if (best) fileSel.value = best;
 
-  await loadAgentChatArtifact();
+  if (best) await loadAgentChatArtifact();
+  else $("#agent-chat-content").innerHTML = renderAgentActivity(agentName) + `<p class="muted small" style="padding:16px">No saved prompt/output artifact for this agent in ${esc(iteration)}.</p>`;
+}
+
+function renderAgentActivity(agentName) {
+  const entries = (state.detail?.state?.agent_activity || [])
+    .filter(entry => entry.agent === agentName)
+    .slice(-120)
+    .reverse();
+  if (!entries.length) {
+    return `<section class="agent-activity"><h3>Recorded activity</h3><p class="muted small">No live activity was captured yet. Older runs can still expose this agent's saved prompt/output below.</p></section>`;
+  }
+  return `<section class="agent-activity"><div class="agent-activity-heading"><h3>Recorded activity</h3><span class="muted small">latest ${entries.length}</span></div>${entries.map(entry => `<article class="agent-activity-entry"><span class="agent-activity-time">${esc(fmtTime(entry.created_at))}</span><span class="agent-activity-type">${esc(entry.event_type)}</span><div class="agent-activity-detail">${esc(entry.detail)}</div></article>`).join("")}</section>`;
 }
 
 async function loadAgentChatArtifact() {
@@ -1453,6 +1621,7 @@ async function loadAgentChatArtifact() {
   const display = raw.replace(/<GOAL_AGENT_JSON>/g, "").replace(/<\/GOAL_AGENT_JSON>/g, "").trim();
 
   contentEl.innerHTML = `
+    ${renderAgentActivity(state.agentChat.agentName)}
     <div class="agent-chat-meta">
       <span class="muted small">${esc(iteration)} / ${esc(filename)}</span>
       <span class="muted small">${display.length.toLocaleString()} chars</span>

@@ -78,6 +78,27 @@ class GoalSupervisor:
     async def resume(self, goal_id: str) -> None:
         await self.start(goal_id, note="Resumed from GUI")
 
+    async def restart(self, goal_id: str, *, note: str = "Restarted from GUI") -> None:
+        """Replace an existing loop task so it reloads all persisted control state."""
+
+        task: asyncio.Task[Any] | None = None
+        async with self._lock:
+            self._discard_finished()
+            store = self.project_store.for_goal(goal_id)
+            store.require_initialized()
+            task = self._tasks.get(goal_id)
+            if task is not None and not task.done():
+                # Tell cooperative tools to stop as well as cancelling the
+                # parent task.  Awaiting it below releases the loop file lock
+                # before the fresh task is created.
+                store.update_control(desired_state="paused", note="Restarting from GUI")
+                task.cancel()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        async with self._lock:
+            self._discard_finished()
+        await self.start(goal_id, note=note)
+
     async def stop(self, goal_id: str, *, note: str = "Stopped from GUI") -> None:
         store = self.project_store.for_goal(goal_id)
         store.require_initialized()

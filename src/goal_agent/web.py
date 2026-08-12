@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from .command_resolver import resolve_executable
 from .models import (
     AppConfig,
+    apply_criteria_revision as build_criteria_revision,
     CriteriaDocument,
     CriterionDefinition,
     EventRecord,
@@ -822,6 +823,111 @@ def create_app(
             )
         )
         return document.model_dump(mode="json")
+
+    @app.post("/api/goals/{goal_id}/criteria-revisions/{criterion_id}/apply")
+    async def apply_criteria_revision(
+        goal_id: str,
+        criterion_id: str,
+        project_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """Apply one strategist proposal, then restart that goal from a clean serial state."""
+
+        runtime = await center.runtime(project_id)
+        store = _goal_store(runtime.store, goal_id)
+        state = store.load_state()
+        suggestion = next(
+            (
+                item
+                for item in state.criteria_revision_suggestions
+                if item.criterion_id == criterion_id
+            ),
+            None,
+        )
+        if suggestion is None:
+            raise HTTPException(status_code=404, detail="Criteria revision suggestion was not found")
+        current = store.read_criteria()
+        try:
+            document, already_current = build_criteria_revision(current, suggestion)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if already_current:
+            state.criteria_revision_suggestions = [
+                item for item in state.criteria_revision_suggestions if item.criterion_id != criterion_id
+            ]
+            state.message = f"Dismissed already-applied criteria revision for {criterion_id}"
+            store.save_state(state)
+            store.append_event(
+                EventRecord(
+                    type="criteria_revision_already_current",
+                    message=f"Dismissed already-applied criteria revision for {criterion_id}",
+                    data={"criterion_id": criterion_id, "revision": current.revision},
+                )
+            )
+            return await _goal_detail(store, runtime.supervisor)
+
+        store.write_criteria(document)
+
+        state.criteria_revision_suggestions = [
+            item for item in state.criteria_revision_suggestions if item.criterion_id != criterion_id
+        ]
+        state.serial_target_criterion = None
+        state.serial_consecutive_no_progress = 0
+        state.consecutive_no_progress = 0
+        state.serial_strict_recovery = False
+        state.last_error = None
+        state.message = f"Applied criteria revision for {criterion_id}; restarting"
+        store.save_state(state)
+        store.append_event(
+            EventRecord(
+                type="criteria_revision_applied",
+                message=f"Applied approved criteria revision for {criterion_id}",
+                data={"criterion_id": criterion_id, "revision": document.revision},
+            )
+        )
+        try:
+            await runtime.supervisor.restart(
+                goal_id, note=f"Applied criteria revision for {criterion_id}; restarted from GUI"
+            )
+        except ConcurrencyLimitReached as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return await _goal_detail(store, runtime.supervisor)
+
+    @app.post("/api/goals/{goal_id}/criteria-revisions/{criterion_id}/dismiss")
+    async def dismiss_criteria_revision(
+        goal_id: str,
+        criterion_id: str,
+        project_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """Dismiss an advisory revision without changing criteria or restarting work."""
+
+        runtime = await center.runtime(project_id)
+        store = _goal_store(runtime.store, goal_id)
+        state = store.load_state()
+        if not any(
+            item.criterion_id == criterion_id
+            for item in state.criteria_revision_suggestions
+        ):
+            raise HTTPException(status_code=404, detail="Criteria revision suggestion was not found")
+        state.criteria_revision_suggestions = [
+            item
+            for item in state.criteria_revision_suggestions
+            if item.criterion_id != criterion_id
+        ]
+        state.serial_target_criterion = None
+        state.serial_consecutive_no_progress = 0
+        state.consecutive_no_progress = 0
+        state.serial_strict_recovery = False
+        state.message = f"Ignored criteria revision suggestion for {criterion_id}; ready to resume"
+        store.save_state(state)
+        store.append_event(
+            EventRecord(
+                type="criteria_revision_dismissed",
+                message=f"Ignored criteria revision suggestion for {criterion_id}",
+                data={"criterion_id": criterion_id},
+            )
+        )
+        return await _goal_detail(store, runtime.supervisor)
 
     @app.post("/api/goals/{goal_id}/setup-complete")
     async def setup_complete(

@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 from goal_agent.models import AppConfig, StrategyDecision
-from goal_agent.opencode import OpenCodeRunner, extract_json_payload
+from goal_agent.opencode import OpenCodeRunner, _profile_permissions, extract_json_payload
 
 
 def test_extract_marker_json() -> None:
@@ -19,6 +19,22 @@ def test_extract_marker_json() -> None:
 
 def test_extract_fenced_json() -> None:
     assert extract_json_payload('```json\n{"passed": true}\n```') == {"passed": True}
+
+
+def test_executor_recovery_allows_only_python_shell_commands() -> None:
+    permissions = _profile_permissions("executor_recovery", recovery_level=0)
+
+    assert permissions["glob"] == "deny"
+    assert permissions["list"] == "deny"
+    assert permissions["grep"] == "deny"
+    assert permissions["read"] == "deny"
+    assert permissions["bash"] == {
+        "*": "deny",
+        "python *": "allow",
+        "py *": "allow",
+        ".\\.venv\\Scripts\\python.exe *": "allow",
+        "& .\\.venv\\Scripts\\python.exe *": "allow",
+    }
 
 
 def _config(tmp_path: Path, script: Path, *, auto_approve: bool = True) -> AppConfig:
@@ -405,7 +421,9 @@ print(json.dumps({"type":"text","part":{"type":"text","text":text}}))
     assert (tmp_path / "calls.txt").read_text() == "2"
     first = json.loads((tmp_path / "env-1.json").read_text(encoding="utf-8"))
     second = json.loads((tmp_path / "env-2.json").read_text(encoding="utf-8"))
-    assert first["agent"]["build"]["steps"] == 6
+    assert first["agent"]["build"]["steps"] == 8
+    assert first["agent"]["build"]["mode"] == "primary"
+    assert "coding executor" in first["agent"]["build"]["prompt"]
     assert second["agent"]["build"]["steps"] == 3
     assert second["agent"]["build"]["permission"].get("task", "deny") == "deny"
     assert any(kind == "context_recovery" for kind, _ in statuses)

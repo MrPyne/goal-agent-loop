@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
+import re
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -147,6 +148,21 @@ class CriterionDefinition(BaseModel):
         return self
 
 
+_EXTERNAL_BENCHMARK_CRITERION = re.compile(
+    r"\b(?:livebench|bfcl|browsecomp|tau[-_ ]?bench)\b", re.IGNORECASE
+)
+
+
+def is_named_external_benchmark(criterion: CriterionDefinition) -> bool:
+    """Whether a criterion names a benchmark that requires an official run."""
+
+    return bool(
+        _EXTERNAL_BENCHMARK_CRITERION.search(
+            f"{criterion.id} {criterion.description} {criterion.command or ''}"
+        )
+    )
+
+
 class CriteriaDocument(BaseModel):
     revision: int = 1
     criteria: list[CriterionDefinition] = Field(default_factory=list)
@@ -189,6 +205,159 @@ class CriterionAnalysis(BaseModel):
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
+class CriteriaRevisionSuggestion(BaseModel):
+    """A review-required replacement for one or more success criteria."""
+
+    criterion_id: str
+    rationale: str
+    # A criteria revision is exceptional.  Keep its admission reason explicit
+    # so the loop can reject a model's generic "remove the failing check"
+    # suggestion without interrupting implementation work.
+    revision_reason: Literal[
+        "not_meaningful", "unachievable", "contradictory", "duplicate"
+    ] | None = None
+    proposed_criteria: list[CriterionDefinition] = Field(default_factory=list)
+    remove_target: bool = False
+    safeguards: list[str] = Field(default_factory=list)
+    approval_required: bool = True
+
+
+def _criterion_contract(item: CriterionDefinition) -> dict[str, object]:
+    """Return only fields that change how a criterion is actually verified."""
+
+    contract: dict[str, object] = {
+        "id": item.id,
+        "description": item.description,
+        "kind": item.kind,
+        "required": item.required,
+        "override": item.override,
+    }
+    if item.kind == CriterionKind.COMMAND:
+        contract.update(
+            command=item.command,
+            expected_exit_code=item.expected_exit_code,
+            timeout_seconds=item.timeout_seconds,
+            stdout_contains=item.stdout_contains,
+            stderr_contains=item.stderr_contains,
+            stdout_regex=item.stdout_regex,
+            stderr_regex=item.stderr_regex,
+            output_case_sensitive=item.output_case_sensitive,
+            output_judge_prompt=item.output_judge_prompt,
+            output_confidence_threshold=item.output_confidence_threshold,
+        )
+    elif item.kind == CriterionKind.FILE_EXISTS:
+        contract["path"] = item.path
+    elif item.kind == CriterionKind.FILE_CONTAINS:
+        contract.update(
+            path=item.path,
+            contains=item.contains,
+            regex=item.regex,
+            case_sensitive=item.case_sensitive,
+        )
+    elif item.kind == CriterionKind.AI_JUDGE:
+        contract.update(
+            judge_prompt=item.judge_prompt,
+            evidence_paths=item.evidence_paths,
+            confidence_threshold=item.confidence_threshold,
+        )
+    return contract
+
+
+def apply_criteria_revision(
+    current: "CriteriaDocument", suggestion: CriteriaRevisionSuggestion
+) -> tuple["CriteriaDocument", bool]:
+    """Return the approved replacement document and whether it is already current.
+
+    A suggestion is anchored to ``criterion_id``.  Its proposed criteria replace
+    that one criterion as a unit, so a split never leaves the broad original
+    criterion behind alongside its atomic replacements.
+    """
+
+    current_by_id = {item.id: item for item in current.criteria}
+    target = current_by_id.get(suggestion.criterion_id)
+    if target is not None and is_named_external_benchmark(target):
+        raise ValueError(
+            "Strategist proposals cannot revise named external benchmark criteria. "
+            "Repair the official runner, adapter, data, scorer, or evidence instead."
+        )
+
+    if suggestion.remove_target:
+        if suggestion.proposed_criteria:
+            raise ValueError(
+                "A removal criteria revision must not include replacement criteria"
+            )
+        if suggestion.criterion_id not in current_by_id:
+            return current, True
+        revised = CriteriaDocument(
+            revision=current.revision + 1,
+            criteria=[
+                item for item in current.criteria if item.id != suggestion.criterion_id
+            ],
+        )
+        return revised, False
+
+    if not suggestion.proposed_criteria:
+        raise ValueError("Criteria revision has no proposed criteria")
+    proposed_ids = [item.id for item in suggestion.proposed_criteria]
+    if len(set(proposed_ids)) != len(proposed_ids):
+        raise ValueError("Criteria revision contains duplicate criterion IDs")
+
+    if target is None:
+        # A stale suggestion is harmless only when every proposed replacement
+        # is already present verbatim in the saved criteria.
+        already_current = all(
+            current_by_id.get(item.id) == item for item in suggestion.proposed_criteria
+        )
+        if already_current:
+            return current, True
+        raise ValueError(
+            f"Criteria revision target '{suggestion.criterion_id}' no longer exists"
+        )
+
+    conflicting_ids = [
+        item.id
+        for item in suggestion.proposed_criteria
+        if item.id != suggestion.criterion_id and item.id in current_by_id
+    ]
+    if conflicting_ids:
+        raise ValueError(
+            "Criteria revision would overwrite unrelated criteria: "
+            + ", ".join(conflicting_ids)
+        )
+
+    merged: list[CriterionDefinition] = []
+    for item in current.criteria:
+        if item.id == suggestion.criterion_id:
+            merged.extend(suggestion.proposed_criteria)
+        else:
+            merged.append(item)
+    revised = CriteriaDocument(revision=current.revision + 1, criteria=merged)
+    # Evidence-path annotations do not alter a command criterion's execution
+    # contract.  Treat such suggestions as already current so an LLM cannot
+    # pause work merely to attach documentation to the same command.
+    current_contracts = [_criterion_contract(item) for item in current.criteria]
+    revised_contracts = [_criterion_contract(item) for item in revised.criteria]
+    return revised, revised_contracts == current_contracts
+
+
+class SerialCriterionDiagnosis(BaseModel):
+    """Independent diagnosis used before a serial executor repeats a failed check."""
+
+    classification: Literal[
+        "implementation_defect",
+        "model_capability",
+        "criterion_measurement_mismatch",
+        "missing_evidence",
+        "environment",
+        "unknown",
+    ] = "unknown"
+    summary: str
+    root_cause: str
+    recommended_project_change: str = ""
+    executor_plan: list[str] = Field(default_factory=list)
+    criteria_revision: CriteriaRevisionSuggestion | None = None
+
+
 class EvaluationAnalysis(BaseModel):
     iteration: int = 0
     label: str = ""
@@ -210,6 +379,16 @@ class AgentStatus(BaseModel):
     detail: str = ""
     started_at: datetime | None = None
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class AgentActivity(BaseModel):
+    """A bounded, persisted event emitted while an agent is carrying out a step."""
+
+    agent: str
+    iteration: int
+    event_type: str
+    detail: str
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class Hypothesis(BaseModel):
@@ -247,8 +426,14 @@ class RunState(BaseModel):
             "evaluator": AgentStatus(name="evaluator"),
         }
     )
+    agent_activity: list[AgentActivity] = Field(default_factory=list)
     hypotheses: list[Hypothesis] = Field(default_factory=list)
+    criteria_revision_suggestions: list[CriteriaRevisionSuggestion] = Field(default_factory=list)
     consecutive_no_progress: int = 0
+    serial_consecutive_no_progress: int = 0
+    # After a serial target stalls once, retry it with the restricted executor
+    # profile before asking the user to intervene.
+    serial_strict_recovery: bool = False
     last_error: str | None = None
     # Serial criterion mode: tracks the criterion currently being targeted.
     # None  = find next failing required criterion.

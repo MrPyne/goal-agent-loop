@@ -474,6 +474,18 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .proposal-warning p { margin: 4px 0 0; color: var(--muted); font-size: 9px; line-height: 1.45; }
 .analysis-progress-badge { display: inline-block; margin-top: 8px; border-radius: 999px; padding: 4px 8px; color: var(--green); background: rgba(69,209,154,.1); font-size: 9px; font-weight: 800; }
 
+.criteria-revision-card { border-color: rgba(242,194,85,.42); background: linear-gradient(180deg, rgba(242,194,85,.08), var(--panel)); }
+.criteria-revision-intro { margin: 7px 0 11px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.criteria-revision-list { display: grid; gap: 9px; margin-bottom: 11px; }
+.criteria-revision-item { padding: 10px; border: 1px solid rgba(242,194,85,.22); border-radius: 9px; background: rgba(0,0,0,.13); }
+.criteria-revision-item > p { margin: 6px 0; color: var(--text); font-size: 10px; line-height: 1.5; }
+.criteria-revision-removal { color: var(--amber) !important; }
+.criteria-revision-item details { margin-top: 7px; color: var(--muted); font-size: 9px; line-height: 1.45; }
+.criteria-revision-item summary { cursor: pointer; color: var(--muted); font-weight: 750; }
+.criteria-revision-item ul { margin: 6px 0 0; padding-left: 16px; }
+.criteria-revision-item li { margin: 4px 0; }
+.criteria-revision-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+
 /* ── Agent chat modal ─────────────────────────────────────── */
 .agent-chat-panel { display: flex; flex-direction: column; max-height: 90vh; width: min(900px, 95vw); }
 .agent-chat-toolbar { display: flex; align-items: center; gap: 8px; padding: 12px 20px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
@@ -482,6 +494,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .agent-chat-meta { display: flex; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
 .agent-chat-pre { margin: 0; padding: 16px; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 0.79em; line-height: 1.6; color: var(--text); background: var(--panel); }
 .agent-chat-btn { padding: 3px 10px !important; width: 100%; }
+.agent-activity { padding: 14px 16px 6px; border-bottom: 1px solid var(--border); background: var(--panel); }
+.agent-activity-heading { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
+.agent-activity-heading h3, .agent-activity h3 { margin: 0; font-size: 0.9em; }
+.agent-activity-entry { display: grid; grid-template-columns: 72px 78px minmax(0, 1fr); gap: 8px; padding: 7px 0; border-top: 1px solid color-mix(in srgb, var(--border) 65%, transparent); font-size: 0.78em; }
+.agent-activity-time, .agent-activity-type { color: var(--muted); font-family: var(--mono); }
+.agent-activity-type { color: var(--accent); }
+.agent-activity-detail { white-space: pre-wrap; word-break: break-word; }
 
 /* ── Hypothesis plan steps ────────────────────────────────── */
 .hypothesis-plan-details { margin: 10px 0 4px; }

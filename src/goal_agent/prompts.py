@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from .models import CriteriaDocument, Hypothesis, RunState
 
@@ -59,6 +60,30 @@ def _criterion_payload(criteria: CriteriaDocument) -> list[dict]:
             row["confidence_threshold"] = item.confidence_threshold
         payload.append(row)
     return payload
+
+
+def _implementation_diagnosis_payload(diagnosis: object) -> dict[str, object]:
+    """Keep a serial executor focused on the one actionable repair."""
+
+    plan = list(getattr(diagnosis, "executor_plan", None) or [])
+    direct_action = ""
+    for step in plan:
+        candidate = re.sub(
+            r"^(?:step\s*)?\d+\s*[:.)-]\s*", "", str(step).strip(), flags=re.IGNORECASE
+        )
+        if candidate.lower().startswith(
+            ("create ", "implement ", "write ", "add ", "fix ", "edit ", "patch ")
+        ):
+            direct_action = candidate
+            break
+    return {
+        "classification": getattr(diagnosis, "classification", "unknown"),
+        "root_cause": _clip(getattr(diagnosis, "root_cause", ""), 1000),
+        "recommended_project_change": _clip(
+            getattr(diagnosis, "recommended_project_change", ""), 1800
+        ),
+        "first_direct_implementation_action": _clip(direct_action, 1400),
+    }
 
 
 def _analysis_payload(state: RunState) -> dict | None:
@@ -376,6 +401,8 @@ def criterion_fix_prompt(
     result,     # CriterionResult
     criteria: CriteriaDocument,
     steering: str,
+    repair_diagnosis=None,
+    execution_directive: str = "",
 ) -> str:
     """Single-criterion executor prompt for serial fix mode.
 
@@ -393,6 +420,32 @@ def criterion_fix_prompt(
     elif criterion.output_judge_prompt:
         judge_hint = f"\nOUTPUT JUDGE RUBRIC:\n{_clip(criterion.output_judge_prompt, 2000)}"
     required_by = [c.id for c in criteria.criteria if c.required and not c.id == criterion.id]
+    diagnosis_hint = "(No independent diagnosis was available; use the failure evidence.)"
+    first_direct_action = ""
+    if repair_diagnosis is not None:
+        diagnosis_payload = _implementation_diagnosis_payload(repair_diagnosis)
+        diagnosis_hint = json.dumps(diagnosis_payload, indent=2)
+        first_direct_action = str(
+            diagnosis_payload.get("first_direct_implementation_action") or ""
+        )
+    implementation_requirement = ""
+    if repair_diagnosis is not None and (
+        repair_diagnosis.recommended_project_change or repair_diagnosis.executor_plan
+    ):
+        implementation_requirement = """
+
+MANDATORY IMPLEMENTATION BEHAVIOR
+The independent diagnosis already identifies a project change that can move this criterion.
+Make that change now. If it calls for a new script or structured evidence pipeline, creating the
+script is the minimum relevant change; do not substitute project reconnaissance for implementation.
+Choose the first plan item that directly serves this criterion (skip work that belongs only to another
+criterion). Read only the directly relevant existing script/config files needed to implement it.
+Do not list the project root, recursively enumerate logs/ or outputs/, or look for criteria.yaml in
+the project root: the criterion and failure evidence are already supplied above.
+Never fabricate a checkpoint, promotion pass, replay score, or historical log. If a required artifact
+is genuinely absent, implement and run the code path that produces it (for example the missing stage
+training or evaluation), then record the actual result.
+""".strip()
     return f"""
 You are the executor in a persistent autonomous goal loop operating in single-criterion fix mode.
 Your ONLY task this iteration is to make the one criterion below pass.
@@ -416,19 +469,173 @@ Evidence:
 {evidence_lines}
 
 LIVE USER STEERING
-{_clip(steering, 3000)}
+{_clip(steering, 1800)}
+
+INDEPENDENT REPAIR DIAGNOSIS
+{diagnosis_hint}
+
+SYSTEM EXECUTION DIRECTIVE
+{_clip(execution_directive, 2500) if execution_directive else '(No extra directive.)'}
+{implementation_requirement}
+
+FIRST REQUIRED ACTION
+{("Use edit/write now to perform this action: " + first_direct_action) if first_direct_action else "Make the first source edit identified by the recommended project change now."}
+Do not use bash, read, list, glob, or grep before that first edit. If the named file is absent, create it with
+the edit/write tool; do not use a shell command to construct it.
 
 INSTRUCTIONS
 1. Inspect the failure evidence above — that is your full diagnosis.
 2. Make the MINIMUM change required to satisfy the criterion.  Prefer editing an
    existing file over creating a new one; prefer a small targeted fix over a rewrite.
+   This workspace runs commands through Windows PowerShell. Use PowerShell syntax
+   (for example `;`, `Test-Path`, and `Get-Content`) even if the tool is labelled
+   `bash`; never use Unix-only shell operators such as `||` or `&&`, `head`, or
+   shell-specific path expansion.
 3. If the criterion requires a COMMAND, run the command after your fix and include the
    output in your report so the evaluator can confirm without re-running everything.
 4. If the fix requires creating a NEW SCRIPT, create it, run it, and verify it exits
    with the expected code before reporting.
 5. Do NOT run quality_gate.py, promotion_check.py, or any eval that takes > 5 minutes —
    those are handled by the automated criterion evaluator, not the executor.
-6. Report: files changed, commands run, exact output, and whether the criterion now passes.
+6. A criteria_revision in the diagnosis is advisory; never silently edit
+   `.goal-agent/control/criteria.yaml`. You MAY change a project verification script when doing
+   so makes it faithfully measure the existing criterion. Do not merely lower a threshold or remove
+   a check to force a pass; split unrelated checks into separate measurements when warranted.
+7. Missing test or benchmark infrastructure is implementation work. When a criterion needs a runner,
+   dataset, model adapter, scorer, raw-result artifact, provenance record, or validation script, create or
+   repair those project components and validate each piece. Do not ask to change the criterion merely because
+   those components do not exist yet.
+8. For a named external benchmark, first use its official repository/docs to discover the real installation
+   and execution interface. Do not guess a Python API or CLI. Never substitute fixed task outcomes, random
+   outcomes, a fixture, a diagnostic subset, or copied results for an official run, and never label such output
+   as official. If installation or model-adapter integration fails, preserve the failure, report the exact command
+   and error, and implement the next missing integration component; keep the criterion failing.
+9. Report: files changed, commands run, exact output, and whether the criterion now passes.
+""".strip()
+
+
+def serial_criterion_diagnosis_prompt(
+    *,
+    goal: str,
+    criterion,
+    result,
+    criteria: CriteriaDocument,
+    criteria_results: dict[str, object],
+    steering: str,
+) -> str:
+    """Ask for a contract-level diagnosis before serial mode asks the executor to act."""
+
+    evidence = [_clip(item, 4000) for item in (result.evidence or [])[-6:]]
+    related_results = [
+        {
+            "criterion_id": item.id,
+            "status": getattr(criteria_results.get(item.id), "status", "unchecked"),
+            "passed": bool(getattr(criteria_results.get(item.id), "passed", False)),
+            "summary": _clip(getattr(criteria_results.get(item.id), "summary", ""), 700),
+        }
+        for item in criteria.criteria
+        if item.id != criterion.id and criteria_results.get(item.id) is not None
+    ]
+    return f"""
+You are the diagnostic criterion-repair strategist for a persistent autonomous goal loop.
+You do not edit files or run tools. Diagnose whether the failed verification command is actually
+measuring the success criterion it is being used to prove, then give the executor a concrete plan.
+
+OVERALL GOAL
+{_clip(goal, 6000)}
+
+TARGET CRITERION
+{json.dumps(_criterion_payload(CriteriaDocument(criteria=[criterion]))[0], indent=2)}
+
+FAILURE RESULT
+{json.dumps({
+    "status": result.status,
+    "summary": _clip(result.summary, 1800),
+    "error": _clip(result.error, 1200) if result.error else None,
+    "evidence": evidence,
+}, indent=2)}
+
+OTHER CRITERIA
+{json.dumps(_criterion_payload(criteria), indent=2)}
+
+OTHER CRITERIA RESULTS
+{json.dumps(related_results, indent=2)}
+
+LIVE USER STEERING
+{_clip(steering, 4000)}
+
+Return a concise structured diagnosis. Classify the primary cause as one of implementation_defect,
+model_capability, criterion_measurement_mismatch, missing_evidence, environment, or unknown.
+
+EVIDENCE-PATH AUDIT
+Before classifying a missing-evidence failure, compare every named required artifact in the failure result,
+steering, and rubric with the criterion's evidence_paths. If a structured artifact (for example a JSON/JSONL
+result file) is named as required but is absent from evidence_paths, classify this as
+criterion_measurement_mismatch and propose a review-required replacement that adds the artifact. Do not send
+the executor to recreate an artifact merely because the judge was not given a path to inspect. A genuine
+missing_evidence classification is appropriate only when the required artifact is already in evidence_paths
+or the result contains direct proof that its production command failed.
+When steering specifies an artifact schema, preserve that schema in any proposed replacement; adding an
+evidence path must not make a malformed artifact pass.
+
+If the command bundles several independent properties, identify the mismatch explicitly. Recommend
+the project-code change that would make the command faithfully measure the CURRENT criterion; this
+can include changing a gate script or splitting its output into independent metrics. Do not recommend
+lowering a threshold or deleting a check merely to obtain a pass.
+
+CRITERIA-REVISION ADMISSION GATE
+criteria_revision MUST be null by default. Set it only when, and only when, the current criterion is:
+1. not_meaningful — it cannot express a coherent observable outcome;
+2. unachievable — direct evidence proves no legal in-scope implementation can satisfy it, not merely that
+   code, a dataset, a runner, or an integration is currently missing;
+3. contradictory — it is logically incompatible with a named current criterion; or
+4. duplicate — another independent criterion directly verifies the same required behavior.
+When non-null, set criteria_revision.revision_reason to exactly one of not_meaningful, unachievable,
+contradictory, or duplicate, and give concrete evidence for that reason in the rationale and safeguards.
+For every other failure — including missing scripts, datasets, official benchmark packages, adapters, scorers,
+raw traces, validation code, configuration, or output artifacts — criteria_revision MUST remain null. These are
+project implementation tasks. Include the component-by-component build and validation plan in executor_plan.
+
+Only include criteria_revision when the current criteria themselves should change. It must be a complete,
+review-required replacement for the affected criterion(s), preserve the goal's intended standard, and use atomic
+independently verifiable checks. A suggestion is advisory: the user must approve it before criteria.yaml is
+changed. If the existing criterion is sound but its command is the wrong proxy, leave criteria_revision null and
+recommend a project-code fix instead.
+
+Before returning criteria_revision, compare every proposed criterion with CURRENT CRITERIA. Return
+criteria_revision null when the intended replacement/split is already present. If splitting the target
+criterion into several atomic criteria, proposed_criteria is the complete replacement set: do not retain
+or re-propose the broad original criterion unless it remains independently necessary.
+For a command criterion, adding evidence_paths or explanatory safeguards without changing the command,
+its expected output/exit conditions, threshold, or success semantics is not a criteria revision. Return
+criteria_revision null and direct the executor to implement or repair the command's producer instead.
+
+DUPLICATE-CRITERION RULE
+Compare TARGET CRITERION against OTHER CRITERIA RESULTS. If another passing criterion already verifies the
+same required behavior using live/direct evidence, while the target relies on a stub, replay, fixture, or
+non-live proxy, the target is redundant rather than a reason to repair the project. In that case, return a
+review-required criteria_revision with remove_target=true and proposed_criteria=[]; explain the overlap and
+name the stronger passing criterion. Do not send the executor to make the weaker proxy pass.
+
+EXTERNAL-BENCHMARK NON-REMOVAL RULE
+A named external benchmark, score threshold, or comparison requirement in the goal is an independent required
+outcome. Never propose removing its criterion merely because a comparison report, aggregate score, fixture, or
+another criterion claims to cover it. This applies especially when the failing command reports a fallback,
+diagnostic subset, placeholder, generated score, missing official package, missing raw traces, or unverified
+provenance. Those are implementation/evidence failures, not redundancy. Leave criteria_revision null and direct
+the executor to implement the official harness, model adapter, scorer, and traceable raw-result artifacts.
+Only consider a benchmark criterion redundant if the goal itself explicitly makes it optional AND another direct
+official run of the identical benchmark already passes with independently inspectable provenance and raw results.
+
+CHECKER-TO-PRODUCER AUDIT
+For a failed command that parses or scores another program's transcript, treat the checker and the producer as
+separate components. Do not classify this as model_capability merely because the checker reports zero calls or
+zero passes: that conclusion requires raw producer output showing the model did not perform the action. When the
+failure evidence contains only checker summaries, classify it as implementation_defect or unknown and direct the
+executor to run one small, equivalent producer command (not the full gate), compare its exact event markers and
+values against the checker's predicates, and patch the checker if it rejects a conforming transcript. Likewise,
+identify stub or replay evaluators that only inspect recorded dataset metadata; their pass rates are not evidence
+of live model behavior. Never lower the requested behavioral threshold to conceal a parser defect.
 """.strip()
 
 
@@ -557,4 +764,3 @@ ACTION POLICY
 - If execution is blocked, record the exact failing command, error, and the minimum patch needed to unblock the next
     run. Do not stop at file listing and static inspection alone.
 """
-

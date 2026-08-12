@@ -18,7 +18,14 @@ from .process_utils import process_group_kwargs, terminate_process_tree
 T = TypeVar("T", bound=BaseModel)
 StatusCallback = Callable[[str, str], None]
 CancelCheck = Callable[[], str | None]
-OpenCodeProfile = Literal["default", "analysis", "judge", "executor", "refinement"]
+OpenCodeProfile = Literal[
+    "default", "analysis", "judge", "executor", "executor_recovery", "refinement"
+]
+
+# A private child-process agent name. It deliberately does not reuse OpenCode's
+# built-in ``build`` or ``plan`` agents: providers can attach incompatible
+# stop/read-only behavior to those roles.
+GOAL_AGENT_EXECUTOR_AGENT = "goal-agent-executor"
 
 JSON_START = "<GOAL_AGENT_JSON>"
 JSON_END = "</GOAL_AGENT_JSON>"
@@ -47,6 +54,7 @@ _PROFILE_PROMPT_CHAR_LIMITS: dict[OpenCodeProfile, int] = {
     "analysis": 72_000,
     "judge": 72_000,
     "executor": 80_000,
+    "executor_recovery": 40_000,
     "refinement": 64_000,
 }
 _PROFILE_STEPS: dict[OpenCodeProfile, int] = {
@@ -58,7 +66,14 @@ _PROFILE_STEPS: dict[OpenCodeProfile, int] = {
     # Leave these profiles uncapped and deny their tools instead.
     "analysis": 0,
     "judge": 0,
-    "executor": 6,
+    # A focused implementation normally needs one read, one edit, and one
+    # verification command. Six turns was tight enough that the executor could
+    # consume its budget on orientation and end before it edited the diagnosed file.
+    "executor": 8,
+    # A recovery task is deliberately one narrow implementation action. Five
+    # calls are enough for write, focused verification, and a factual report;
+    # more calls invite the same unbounded reconnaissance that triggered recovery.
+    "executor_recovery": 5,
     "refinement": 0,
 }
 _PROFILE_TOOL_OUTPUT_BUDGET_CHARS: dict[OpenCodeProfile, int | None] = {
@@ -66,6 +81,10 @@ _PROFILE_TOOL_OUTPUT_BUDGET_CHARS: dict[OpenCodeProfile, int | None] = {
     "analysis": 0,
     "judge": 0,
     "executor": 120_000,
+    # The recovery executor receives an exact implementation task. Broad
+    # discovery remains denied for this profile, but 48k leaves room to read
+    # the named implementation files before making the requested edit.
+    "executor_recovery": 48_000,
     "refinement": 64_000,
 }
 
@@ -157,6 +176,23 @@ _TOOL_FREE_AGENT_PROMPTS: dict[OpenCodeProfile, str] = {
         "response."
     ),
 }
+
+_EXECUTOR_AGENT_PROMPT = (
+    "You are Goal Agent's autonomous coding executor. Work directly in the supplied "
+    "workspace using the available tools. For an implementation task, make the requested "
+    "source edit before responding; do not stop after explaining, planning, or inspecting. "
+    "Use only focused reads of files named by the task, then edit and run a focused verification. "
+    "Report the actual files changed and commands run in the requested final format."
+)
+
+_EXECUTOR_RECOVERY_AGENT_PROMPT = (
+    "You are Goal Agent's strict recovery coding executor. The supplied task already names "
+    "the required implementation. Your first tool call must create or edit that named source "
+    "file or artifact, using the edit/write tool; do not begin with bash, read, list, glob, or grep. "
+    "After the edit, make at most one focused verification command whose output is small. Never "
+    "run a broad inventory, print an entire log, checkpoint, or data file, or run a long evaluation. "
+    "Report only actual changes and commands."
+)
 
 
 @dataclass(slots=True)
@@ -423,7 +459,7 @@ BOUNDED TASK BRIEF
 """.strip()
 
 
-def _profile_permissions(profile: OpenCodeProfile, *, recovery_level: int) -> dict[str, str]:
+def _profile_permissions(profile: OpenCodeProfile, *, recovery_level: int) -> dict[str, object]:
     """Return a least-privilege permission set for one Goal Agent call."""
 
     deny_all = {"*": "deny"}
@@ -434,7 +470,7 @@ def _profile_permissions(profile: OpenCodeProfile, *, recovery_level: int) -> di
         # tool-free prevents OpenCode from consuming every step on repository
         # reads and then ending without the required proposal response.
         return deny_all
-    if profile == "executor":
+    if profile in {"executor", "executor_recovery"}:
         permissions = {
             "*": "deny",
             "read": "allow",
@@ -446,12 +482,29 @@ def _profile_permissions(profile: OpenCodeProfile, *, recovery_level: int) -> di
             "lsp": "allow",
             "todowrite": "allow",
         }
-        if recovery_level >= 2:
+        if profile == "executor_recovery" or recovery_level >= 2:
             # Exact paths and focused commands only on the strict retry. This
             # prevents another broad exploration from rebuilding the same huge turn.
             permissions["glob"] = "deny"
             permissions["list"] = "deny"
             permissions["grep"] = "deny"
+            # The recovery prompt already contains the diagnosis and first
+            # implementation action. A full-source read from a local model is
+            # the most common way to overflow before that action occurs; force
+            # the small write/run repair instead.
+            permissions["read"] = "deny"
+            # A recovery task may run the named project script after editing it,
+            # but it must not use the shell to print entire logs or inventories.
+            # OpenCode supports command-pattern permissions for bash; keep the
+            # few Windows/Python launch forms the executor needs and deny all
+            # other shell commands before they can create another giant turn.
+            permissions["bash"] = {
+                "*": "deny",
+                "python *": "allow",
+                "py *": "allow",
+                ".\\.venv\\Scripts\\python.exe *": "allow",
+                "& .\\.venv\\Scripts\\python.exe *": "allow",
+            }
         return permissions
     return {
         "*": "deny",
@@ -563,6 +616,19 @@ def _opencode_environment(
             selected["description"] = f"Goal Agent {profile} response-only worker"
             selected["mode"] = "primary"
             selected["prompt"] = response_only_prompt
+        elif profile in {"executor", "executor_recovery"}:
+            # The built-in ``build`` agent can inherit a provider-specific
+            # prefill/system prompt that terminates immediately (one output
+            # token, no tool call). Give the child process a small explicit
+            # coding prompt and primary mode while preserving its configured
+            # name, model, and tool permissions.
+            selected["description"] = "Goal Agent coding executor"
+            selected["mode"] = "primary"
+            selected["prompt"] = (
+                _EXECUTOR_RECOVERY_AGENT_PROMPT
+                if profile == "executor_recovery"
+                else _EXECUTOR_AGENT_PROMPT
+            )
         agents[agent] = selected
         config["agent"] = agents
 
@@ -879,6 +945,7 @@ class OpenCodeRunner:
         interrupted = False
         interrupt_reason: str | None = None
         reader_error: BaseException | None = None
+        termination_wait_timed_out = False
 
         if status_callback:
             status_callback("started", f"OpenCode started (timeout: {timeout}s)")
@@ -927,15 +994,34 @@ class OpenCodeRunner:
                     interrupted = True
                     break
                 await asyncio.sleep(self.config.poll_interval_seconds)
-            await wait_task
+            # On Windows taskkill can remove the visible child process while the
+            # asyncio Process transport never resolves its wait future.  Do not
+            # let that orphaned future block a context-recovery retry forever.
+            try:
+                await asyncio.wait_for(wait_task, timeout=10)
+            except asyncio.TimeoutError:
+                termination_wait_timed_out = True
+                wait_task.cancel()
+                if status_callback:
+                    status_callback(
+                        "context_recovery",
+                        "OpenCode child did not report exit after termination; "
+                        "abandoning the stale wait and starting the compact retry.",
+                    )
         except asyncio.CancelledError:
             if process.returncode is None:
                 await terminate_process_tree(process)
             raise
         finally:
+            if termination_wait_timed_out:
+                for task in (stdout_task, stderr_task):
+                    if not task.done():
+                        task.cancel()
             reader_results = await asyncio.gather(
                 stdout_task, stderr_task, return_exceptions=True
             )
+            if termination_wait_timed_out:
+                await asyncio.gather(wait_task, return_exceptions=True)
             for value in reader_results:
                 if isinstance(value, BaseException) and not isinstance(
                     value, asyncio.CancelledError
@@ -1275,4 +1361,3 @@ def extract_json_payload(text: str) -> dict:
             return candidate
 
     raise ValueError("No proposal JSON object was found in OpenCode's assistant response")
-

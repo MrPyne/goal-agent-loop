@@ -44,6 +44,11 @@ _SHELL_BUILTINS = {
     "popd",
 }
 _PYTHON_LAUNCHERS = {"python", "python3", "py"}
+_METRIC_THRESHOLD = re.compile(
+    r"\b(?:score|accuracy|pass[ -]?rate|success[ -]?rate|percentage)\b[\s\S]{0,100}?"
+    r"\b(?:at least|at most|no more than|>=|<=|above|below)\s*\d+(?:\.\d+)?\s*%?",
+    re.IGNORECASE,
+)
 
 
 def _command_executable(command: str) -> str | None:
@@ -222,6 +227,14 @@ def assess_setup_proposal(
 
         if criterion.kind == CriterionKind.COMMAND and criterion.command:
             command = criterion.command.strip()
+            if _METRIC_THRESHOLD.search(description) and not criterion.output_judge_prompt:
+                add(
+                    cid,
+                    "A numeric score threshold is described, but this command criterion only checks an exit code.",
+                    "Add an output_judge_prompt that explicitly checks the reported metric and its threshold, "
+                    "or use a verifier command that exits non-zero whenever the metric is below the threshold. "
+                    "For external benchmarks, also require official-run provenance and raw result artifacts.",
+                )
             if _TRIVIAL_COMMAND.match(command):
                 add(
                     cid,
